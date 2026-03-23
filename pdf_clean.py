@@ -992,29 +992,22 @@ def rows_to_dataframe(rows: List[ReceiptLineItem]) -> pd.DataFrame:
 			df[column] = ""
 
 	# Prefer the most complete row when receipt splitting produces near-duplicate chunks.
+	# Dedup key: Source File + Source Page + Total Inv Amt (uniquely identifies a receipt)
+	# Keep the row with the most non-empty fields (highest _fill_score)
 	score_columns = [c for c in OUTPUT_COLUMNS if c not in {"Source File", "Source Page"}]
 	df["_fill_score"] = df[score_columns].fillna("").astype(str).apply(
 		lambda row: sum(1 for v in row if str(v).strip()), axis=1
 	)
+	
+	# Simpler dedup key: just use Source File + Source Page + Total Inv Amt
+	# This avoids issues where Agent PAN/BROKER GSTN may vary due to extraction inconsistencies
+	# but the receipt is identical (same page, same amounts)
 	df["_dedup_key"] = (
 		df["Source File"].astype(str).fillna("")
 		+ "|"
 		+ df["Source Page"].astype(str).fillna("")
 		+ "|"
-		+ df["Vendor Inv No"].astype(str).fillna("")
-	)
-
-	blank_inv = df["Vendor Inv No"].fillna("").astype(str).str.strip() == ""
-	df.loc[blank_inv, "_dedup_key"] = (
-		df.loc[blank_inv, "Source File"].astype(str).fillna("")
-		+ "|"
-		+ df.loc[blank_inv, "Source Page"].astype(str).fillna("")
-		+ "|"
-		+ df.loc[blank_inv, "Agent PAN"].astype(str).fillna("")
-		+ "|"
-		+ df.loc[blank_inv, "BROKER GSTN"].astype(str).fillna("")
-		+ "|"
-		+ df.loc[blank_inv, "Total Inv Amt"].astype(str).fillna("")
+		+ df["Total Inv Amt"].astype(str).fillna("")
 	)
 
 	df = df.sort_values("_fill_score", ascending=False).drop_duplicates(subset=["_dedup_key"], keep="first")
