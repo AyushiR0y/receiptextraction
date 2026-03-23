@@ -1,0 +1,47 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE and editor files
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data files - inputs and invoices
+extracted_invoices/
+BALIC_22 To 30 Sep'25 Invoices/
+Non_Individual Invoices 22 To 30 Sep'25/
+*.zip
+*.pdf
+*.jpg
+*.png
+
+# Output files - results
+*.xlsx
+~$*.xlsx
+
+# External tools/dependencies
+poppler-*/
+
+# Documentation files (keep if needed for pipeline)
+*.docx
+*.xlsb
+
+# Debug and test scripts (keep pdf_clean.py, pdf_llm.py, requirements.txt)
+verify_fix.py
+inspect_tax_invoice_text.py
