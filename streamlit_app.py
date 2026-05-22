@@ -94,32 +94,24 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
 
 /* ── Section headers ── */
 .sec-header {{
-    font-size: 0.7rem;
+    font-size: 1.05rem;
     font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    letter-spacing: -0.02em;
     color: {PRIMARY};
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.55rem;
     display: flex;
     align-items: center;
     gap: 0.5rem;
-}}
-.sec-header::after {{
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: {BORDER};
 }}
 
 /* ── Card ── */
 .card {{
     background: transparent;
     border: 0;
-    border-bottom: 1px solid rgba(0,94,172,0.12);
     border-radius: 0;
-    padding: 1.15rem 0 1.15rem;
+    padding: 1rem 0 1rem;
     box-shadow: none;
-    margin-bottom: 1.25rem;
+    margin-bottom: 0.9rem;
 }}
 
 .section-divider {{
@@ -151,7 +143,7 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
     line-height: 1;
 }}
 .stat-chip .lbl {{
-    font-size: 0.7rem;
+    font-size: 0.64rem;
     color: {TEXT_MUTED};
     font-weight: 500;
     text-transform: uppercase;
@@ -199,7 +191,7 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
     box-shadow: 0 2px 8px rgba(0,94,172,0.3);
 }}
 .step-text {{
-    font-size: 0.88rem;
+    font-size: 0.8rem;
     color: {TEXT};
     line-height: 1.5;
 }}
@@ -317,7 +309,7 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
 
 /* Label styling */
 .stTextInput label, .stFileUploader label {{
-    font-size: 0.82rem !important;
+    font-size: 0.72rem !important;
     font-weight: 600 !important;
     color: {TEXT_MUTED} !important;
     text-transform: uppercase !important;
@@ -326,7 +318,7 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
 
 /* Subheader */
 h3 {{
-    font-size: 1rem !important;
+    font-size: 1.15rem !important;
     font-weight: 700 !important;
     color: {TEXT} !important;
     letter-spacing: -0.02em !important;
@@ -334,7 +326,24 @@ h3 {{
 }}
 
 /* Caption */
-.stCaption {{ color: {TEXT_MUTED} !important; font-size: 0.8rem !important; }}
+.stCaption {{ color: {TEXT_MUTED} !important; font-size: 0.73rem !important; }}
+
+/* Smaller body text inside cards */
+.card p, .card li {{
+    font-size: 0.8rem;
+    line-height: 1.45;
+}}
+
+/* Expander tweaks */
+details summary {{
+    font-weight: 700;
+    font-size: 1.02rem;
+    color: {PRIMARY};
+}}
+
+details > div {{
+    padding-top: 0.35rem;
+}}
 
 /* Warning */
 .stWarning {{ background: {ACCENT_SOFT} !important; color: #7A3B0A !important; }}
@@ -491,17 +500,14 @@ with st.form("processing_form"):
         """, unsafe_allow_html=True)
 
         st.markdown("<div style='flex:1'></div>", unsafe_allow_html=True)
-        st.warning("⚠️ Keep this tab open while processing.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
 
-    button_left, button_mid, button_right = st.columns([1, 0.7, 1])
-    with button_mid:
-        st.markdown('<div class="submit-row">', unsafe_allow_html=True)
+        st.warning("⚠️ Keep this tab open while processing.")
         process_clicked = st.form_submit_button(
             "🚀  Process files",
             use_container_width=True,
         )
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BANK PASSWORDS + STATS ROW
@@ -510,56 +516,50 @@ st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 pwd_col, stat_col = st.columns([1.2, 0.8], gap="large")
 
 with pwd_col:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="sec-header">🔐 Bank passwords</div>', unsafe_allow_html=True)
-    st.caption("Edit or add bank/password pairs. Matching runs against the file path or filename.")
+    with st.expander("🔐 Bank passwords", expanded=False):
+        st.caption("Edit or add bank/password pairs. Matching runs against the file path or filename.")
 
-    password_table = st.data_editor(
-        _default_password_table(),
-        use_container_width=True,
-        num_rows="dynamic",
-        hide_index=True,
-        column_config={
-            "Bank Name": st.column_config.TextColumn("Bank Name", width="large"),
-            "Password":  st.column_config.TextColumn("Password",  width="medium"),
-        },
-        key="password_table_editor",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+        password_table = st.data_editor(
+            _default_password_table(),
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "Bank Name": st.column_config.TextColumn("Bank Name", width="large"),
+                "Password":  st.column_config.TextColumn("Password",  width="medium"),
+            },
+            key="password_table_editor",
+        )
 
 with stat_col:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="sec-header">📊 Supported formats</div>', unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="stats-row">
-        <div class="stat-chip"><span class="val">PDF</span><span class="lbl">Encrypted &amp; plain</span></div>
-        <div class="stat-chip"><span class="val">XLS·X</span><span class="lbl">Excel sheets</span></div>
-        <div class="stat-chip"><span class="val">IMG</span><span class="lbl">JPG / PNG</span></div>
-        <div class="stat-chip"><span class="val">ZIP</span><span class="lbl">Bulk archives</span></div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-    st.markdown('<div class="sec-header">✅ Output features</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="step-list">
-        <div class="step-item">
-            <div class="step-num" style="background:#1DA462">✓</div>
-            <div class="step-text">Duplicate receipts removed automatically</div>
+    with st.expander("📊 Supported formats", expanded=False):
+        st.markdown("""
+        <div class="stats-row">
+            <div class="stat-chip"><span class="val">PDF</span><span class="lbl">Encrypted &amp; plain</span></div>
+            <div class="stat-chip"><span class="val">XLS·X</span><span class="lbl">Excel sheets</span></div>
+            <div class="stat-chip"><span class="val">IMG</span><span class="lbl">JPG / PNG</span></div>
+            <div class="stat-chip"><span class="val">ZIP</span><span class="lbl">Bulk archives</span></div>
         </div>
-        <div class="step-item">
-            <div class="step-num" style="background:#1DA462">✓</div>
-            <div class="step-text">Agent codes mapped from master list</div>
-        </div>
-        <div class="step-item">
-            <div class="step-num" style="background:#1DA462">✓</div>
-            <div class="step-text">Single-click Excel download</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="sec-header">✅ Output features</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="step-list">
+            <div class="step-item">
+                <div class="step-num" style="background:#1DA462">✓</div>
+                <div class="step-text">Duplicate receipts removed automatically</div>
+            </div>
+            <div class="step-item">
+                <div class="step-num" style="background:#1DA462">✓</div>
+                <div class="step-text">Agent codes mapped from master list</div>
+            </div>
+            <div class="step-item">
+                <div class="step-num" style="background:#1DA462">✓</div>
+                <div class="step-text">Single-click Excel download</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
