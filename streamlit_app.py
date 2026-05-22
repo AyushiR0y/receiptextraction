@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
 import streamlit as st
@@ -13,6 +14,7 @@ ACCENT_BLUE = "#005EAC"
 ACCENT_ORANGE = "#F58220"
 BG = "#F7FAFD"
 TEXT = "#16324F"
+MUTED = "rgba(22,50,79,0.72)"
 
 
 st.set_page_config(page_title="Commission Extractor", page_icon="CA", layout="wide")
@@ -47,6 +49,20 @@ st.markdown(
         padding: 1rem 1rem 0.4rem;
         box-shadow: 0 10px 30px rgba(22,50,79,0.05);
     }}
+    .subtle {{
+        color: {MUTED};
+        font-size: 0.95rem;
+    }}
+    .pill {{
+        display: inline-block;
+        padding: 0.28rem 0.7rem;
+        border-radius: 999px;
+        background: rgba(0,94,172,0.08);
+        color: {ACCENT_BLUE};
+        font-size: 0.82rem;
+        font-weight: 700;
+        margin-right: 0.45rem;
+    }}
     .stButton > button {{
         background: {ACCENT_BLUE};
         color: white;
@@ -63,6 +79,13 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+SUPPORTED_TYPES = ["pdf", "jpg", "jpeg", "png", "zip", "xlsx", "xlsm", "xlsb", "xls"]
+
+
+def _default_password_table() -> pd.DataFrame:
+	rows = [{"Bank Name": name, "Password": password} for name, password in extractor.BANK_PASSWORDS.items()]
+	return pd.DataFrame(rows, columns=["Bank Name", "Password"])
 
 
 def _normalize_uploaded_name(name: str) -> Path:
@@ -95,33 +118,60 @@ def _append_log(logs: list[str], message: str, placeholder) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
 
+def _password_map_from_table(table: pd.DataFrame) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if table is None or table.empty:
+        return result
+    for _, row in table.iterrows():
+        bank_name = str(row.get("Bank Name", "") or "").strip().lower()
+        password = str(row.get("Password", "") or "").strip()
+        if bank_name and password:
+            result[bank_name] = password
+    return result
+
+
+def _match_password(source_text: str, custom_passwords: dict[str, str]) -> str:
+    probe = (source_text or "").lower()
+    for bank_name in sorted(custom_passwords.keys(), key=len, reverse=True):
+        if bank_name and bank_name in probe:
+            return custom_passwords[bank_name]
+    for bank_name, password in extractor.BANK_PASSWORDS.items():
+        if bank_name and bank_name in probe:
+            return password
+    return ""
+
+
 st.markdown(
     """
     <div class="hero">
+        <div class="pill">Blue #005EAC</div><div class="pill">Orange #F58220</div>
         <h1>Commission Extractor</h1>
-        <p>Upload receipt files or point the app at a local folder, then process and download the mapped Excel.</p>
+        <p>Upload receipt files, a folder, or a ZIP, then process and download the mapped Excel.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-col_left, col_right = st.columns([1.2, 0.8], gap="large")
+st.markdown('<div class="subtle">Tip: folder upload is supported in the browser. The local folder path input only works when the app runs on your machine.</div>', unsafe_allow_html=True)
+
+col_left, col_right = st.columns([1.15, 0.85], gap="large")
 
 with col_left:
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("Inputs")
+    uploaded_files = st.file_uploader(
+        "Upload files or folder",
+        accept_multiple_files="directory",
+        type=SUPPORTED_TYPES,
+        help="Pick multiple files or a whole folder. The browser will upload the selected items to the app.",
+    )
     local_folder = st.text_input(
-        "Local folder path",
+        "Local folder path (local app only)",
         value="",
         placeholder=r"C:\Users\Ayushi.Roy01\Documents\commission\extracted_invoices",
-        help="Use this when the files are already on your machine. Uploading files is supported below too.",
+        help="Use this only when running Streamlit on your own computer. Streamlit Cloud cannot access your private disk.",
     )
-    uploaded_files = st.file_uploader(
-        "Upload files",
-        accept_multiple_files=True,
-        help="Upload PDFs, images, ZIPs, or Excel workbooks.",
-    )
-    pdf_password = st.text_input("PDF password (optional)", value="", type="password")
+    pdf_password = st.text_input("Single PDF password override (optional)", value="", type="password")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_right:
@@ -129,6 +179,37 @@ with col_right:
     st.subheader("Run")
     st.warning("Do not close this tab while processing is running.")
     process_clicked = st.button("Process files", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown('<div style="height:0.4rem"></div>', unsafe_allow_html=True)
+
+pwd_col1, pwd_col2 = st.columns([0.9, 1.1], gap="large")
+with pwd_col1:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("Bank Passwords")
+    st.caption("Edit or add bank/password pairs. Matching is done against the file path or filename.")
+    password_table = st.data_editor(
+        _default_password_table(),
+        use_container_width=True,
+        num_rows="dynamic",
+        hide_index=True,
+        column_config={
+            "Bank Name": st.column_config.TextColumn("Bank Name", width="large"),
+            "Password": st.column_config.TextColumn("Password", width="medium"),
+        },
+        key="password_table_editor",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+with pwd_col2:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("What happens")
+    st.markdown(
+        """
+        - Uploaded items are staged and normalized into the same output schema.
+        - Identical receipts are deduped before export.
+        - The output workbook is generated in one click.
+        """
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -156,6 +237,7 @@ render_logs()
 if process_clicked:
     st.session_state.logs = []
     render_logs()
+    custom_passwords = _password_map_from_table(password_table)
 
     input_paths: list[Path] = []
     staged_root = Path(tempfile.mkdtemp(prefix="commission_streamlit_"))
@@ -163,7 +245,7 @@ if process_clicked:
     if local_folder.strip():
         folder_path = Path(local_folder.strip())
         if not folder_path.exists():
-            st.error(f"Folder does not exist: {folder_path}")
+            st.error(f"Folder does not exist: {folder_path}. If this is Streamlit Cloud, use folder upload instead of a local path.")
             st.stop()
         if not folder_path.is_dir():
             st.error(f"Path is not a folder: {folder_path}")
@@ -200,7 +282,8 @@ if process_clicked:
     for index, file_path in enumerate(unique_inputs, start=1):
         _append_log(st.session_state.logs, f"Processing {index}/{total}: {file_path}", log_placeholder)
         try:
-            rows = extractor.process_path(file_path, override_password=pdf_password or None)
+            password_override = pdf_password.strip() if pdf_password.strip() else _match_password(str(file_path), custom_passwords)
+            rows = extractor.process_path(file_path, override_password=password_override or None)
             if rows:
                 all_rows.extend(rows)
                 _append_log(st.session_state.logs, f"  -> {len(rows)} row(s)", log_placeholder)
@@ -228,6 +311,8 @@ if process_clicked:
 if st.session_state.result_path:
     result_file = Path(st.session_state.result_path)
     if result_file.exists():
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        st.subheader("Download")
         st.download_button(
             label="Download Excel",
             data=result_file.read_bytes(),
@@ -235,3 +320,4 @@ if st.session_state.result_path:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+        st.markdown("</div>", unsafe_allow_html=True)
