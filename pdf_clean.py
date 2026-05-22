@@ -1,5 +1,6 @@
 import argparse
 import base64
+import calendar
 import difflib
 import hashlib
 import io
@@ -26,6 +27,16 @@ except Exception:  # pragma: no cover
 	RapidOCR = None
 
 try:
+	import easyocr
+except Exception:  # pragma: no cover
+	easyocr = None
+
+try:
+	import pytesseract
+except Exception:  # pragma: no cover
+	pytesseract = None
+
+try:
 	from pdf2image import convert_from_bytes
 except Exception:  # pragma: no cover
 	convert_from_bytes = None
@@ -44,13 +55,20 @@ except Exception:  # pragma: no cover
 LOGGER = logging.getLogger("receipt_extractor")
 RAPIDOCR_ENGINE = None
 RAPIDOCR_INIT_FAILED = False
+EASYOCR_READER = None
+EASYOCR_INIT_FAILED = False
 GOOGLE_VISION_API_KEY: Optional[str] = None
 OCR_CACHE_DIR = Path(".ocr_cache")
 AGENT_PAN_BY_NAME: Dict[str, str] = {}
 AGENT_PAN_BY_AADHAAR: Dict[str, str] = {}
+AGENT_CODE_BY_NAME: Dict[str, str] = {}  # Maps agent names to agent codes from agentcode.xlsx
+AGENT_NAME_BY_CODE: Dict[str, str] = {}  # Maps agent codes to clean agent names from agentcode.xlsx
+AGENT_INFO_BY_PAN: Dict[str, Dict[str, str]] = {}  # pan -> info dict (code,name,gstn,...)
+AGENT_INFO_BY_CODE: Dict[str, Dict[str, str]] = {}
 AZURE_OPENAI_CONFIG_CACHE: Optional[Tuple[str, str, str, str]] = None
 AZURE_OPENAI_WORKING_DEPLOYMENT: Optional[str] = None
 GOOGLE_VISION_CALL_COUNT = 0
+GOOGLE_VISION_DISABLED_FOR_RUN = False
 AZURE_AI_CALL_COUNT = 0
 AZURE_AI_INPUT_CHARS = 0
 AZURE_AI_OUTPUT_CHARS = 0
@@ -101,6 +119,114 @@ class ReceiptLineItem:
 	values: Dict[str, str]
 
 
+GSTIN_PATTERN = r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[0-9A-Z]"
+GSTIN_RE = re.compile(rf"\b({GSTIN_PATTERN})\b", re.IGNORECASE)
+
+GSTIN_STATE_CODE_TO_STATE = {
+	"97": "OTHER TERRITORY",
+	"01": "Jammu and Kashmir",
+	"02": "Himachal Pradesh",
+	"03": "Punjab",
+	"04": "Chandigarh",
+	"05": "Uttarakhand",
+	"06": "Haryana",
+	"07": "Delhi",
+	"08": "Rajasthan",
+	"09": "Uttar Pradesh",
+	"10": "Bihar",
+	"11": "Sikkim",
+	"12": "Arunachal Pradesh",
+	"13": "Nagaland",
+	"14": "Manipur",
+	"15": "Mizoram",
+	"16": "Tripura",
+	"17": "Meghalaya",
+	"18": "Assam",
+	"19": "Bengal",
+	"20": "Jharkhand",
+	"21": "Odisha",
+	"22": "Chattisgarh",
+	"23": "Madhya Pradesh",
+	"24": "Gujarat",
+	"25": "DAMAN AND DIU",
+	"26": "DADRA AND NAGAR HAVELI",
+	"27": "Maharashtra",
+	"28": "Andhra Pradesh",
+	"29": "Karnataka",
+	"30": "Goa",
+	"31": "Lakshadweep",
+	"32": "Kerala",
+	"33": "Tamil Nadu",
+	"34": "PUDUCHERRY",
+	"35": "Andaman and Nicobar Islands",
+	"36": "Telangana",
+	"37": "Andhra Pradesh",
+	"38": "Ladakh",
+}
+
+BALIC_PAN = "AADCA1701E"
+BALIC_SERVICE_RECIPIENT_NAME = "Bajaj Life Insurance Company"
+
+
+def normalize_bajaj_company_name(raw_name: str) -> str:
+	if not raw_name:
+		return ""
+	name = re.sub(r"\s+", " ", raw_name).strip()
+	name_low = name.lower()
+	if "bajaj housing" in name_low:
+		return "Bajaj Housing Finance Limited"
+	if "bajaj auto finance" in name_low or "bajaj finance" in name_low:
+		return "Bajaj Finance Limited"
+	if "bajaj auto" in name_low:
+		return "Bajaj Housing Finance Limited"
+	return name
+
+
+def extract_bajaj_company_name(text: str) -> str:
+	if not text:
+		return ""
+	patterns = [
+		r"(Bajaj\s+Housing\s+Finance\s+(?:Limited|Ltd))",
+		r"(Bajaj\s+Auto\s+Finance\s+(?:Limited|Ltd))",
+		r"(Bajaj\s+Finance\s+(?:Limited|Ltd))",
+		r"(Bajaj\s+Allianz\s+Life\s+Insurance(?:\s+Company)?\s+(?:Limited|Ltd))",
+		r"(Bajaj\s+Life\s+Insurance(?:\s+Company)?\s+(?:Limited|Ltd))",
+	]
+	for pattern in patterns:
+		match = re.search(pattern, text, re.IGNORECASE)
+		if match:
+			return normalize_bajaj_company_name(match.group(1))
+	return ""
+
+
+def normalize_balic_service_recipient_name(raw_name: str, context_text: str = "") -> str:
+	candidate = sanitize_party_name(normalize_balic_company_name(raw_name or ""))
+	if candidate and candidate.lower().startswith("bajaj") and "auto" not in candidate.lower():
+		return candidate
+	if context_text:
+		extracted = extract_bajaj_company_name(context_text)
+		if extracted:
+			return extracted
+	cleaned = sanitize_party_name(raw_name or "")
+	if cleaned and cleaned.lower().startswith("bajaj"):
+		return normalize_balic_company_name(cleaned)
+	return cleaned
+
+STATE_NAME_ALIASES = {
+	"west bengal": "Bengal",
+	"chhattisgarh": "Chattisgarh",
+	"andaman and nicobar islands": "Andaman and Nicobar",
+	"dadra and nagar haveli and daman and diu": "DADRA AND NAGAR HAVELI",
+	"puducherry": "PUDUCHERRY",
+	"jammu and kashmir": "Jammu and Kashmir",
+	"andaman and nicobar": "Andaman and Nicobar",
+	"other territory": "OTHER TERRITORY",
+	# common OCR/misspelling variants
+	"telengana": "Telangana",
+	"tamilnadu": "Tamil Nadu",
+}
+
+
 def configure_logging(verbose: bool) -> None:
 	level = logging.DEBUG if verbose else logging.INFO
 	logging.basicConfig(
@@ -141,6 +267,34 @@ def backfill_agent_pan(fields: Dict[str, str], source_text: str) -> Dict[str, st
 	pan = (result.get("Agent PAN", "") or "").strip().upper()
 	aadhaar = extract_aadhaar(source_text)
 	name_key = _normalize_agent_name_key(name)
+	code = (result.get("AGENT_CODE", "") or "").strip().upper()
+
+	def _canonical_agent_pan() -> str:
+		if code and code in AGENT_INFO_BY_CODE:
+			info = AGENT_INFO_BY_CODE[code]
+			if info.get("pan"):
+				return str(info.get("pan") or "").strip().upper()
+		if name_key:
+			mapped_code = AGENT_CODE_BY_NAME.get(name_key)
+			if mapped_code and mapped_code in AGENT_INFO_BY_CODE:
+				info = AGENT_INFO_BY_CODE[mapped_code]
+				if info.get("pan"):
+					return str(info.get("pan") or "").strip().upper()
+			mapped_pan = AGENT_PAN_BY_NAME.get(name_key)
+			if mapped_pan and mapped_pan in AGENT_INFO_BY_PAN:
+				info = AGENT_INFO_BY_PAN[mapped_pan]
+				if info.get("pan"):
+					return str(info.get("pan") or "").strip().upper()
+		if pan and pan in AGENT_INFO_BY_PAN:
+			info = AGENT_INFO_BY_PAN[pan]
+			if info.get("pan"):
+				return str(info.get("pan") or "").strip().upper()
+		return ""
+
+	canonical_pan = _canonical_agent_pan()
+	if canonical_pan and (not pan or not re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan) or pan == BALIC_PAN or pan != canonical_pan):
+		result["Agent PAN"] = canonical_pan
+		pan = canonical_pan
 
 	pan_ok = bool(re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan))
 
@@ -149,6 +303,13 @@ def backfill_agent_pan(fields: Dict[str, str], source_text: str) -> Dict[str, st
 			AGENT_PAN_BY_NAME[name_key] = pan
 		if aadhaar:
 			AGENT_PAN_BY_AADHAAR[aadhaar] = pan
+		# If we have PAN and detailed info, prefer to populate agent code and GSTN too
+		info = AGENT_INFO_BY_PAN.get(pan)
+		if info:
+			if not (result.get("AGENT_CODE", "") or "").strip() and info.get("code"):
+				result["AGENT_CODE"] = info.get("code")
+			if not (result.get("BROKER GSTN", "") or "").strip() and info.get("gstn"):
+				result["BROKER GSTN"] = info.get("gstn")
 		return result
 
 	# Prefer Aadhaar mapping first (stronger identity), then agent-name mapping.
@@ -156,8 +317,142 @@ def backfill_agent_pan(fields: Dict[str, str], source_text: str) -> Dict[str, st
 		result["Agent PAN"] = AGENT_PAN_BY_AADHAAR[aadhaar]
 	elif name_key and name_key in AGENT_PAN_BY_NAME:
 		result["Agent PAN"] = AGENT_PAN_BY_NAME[name_key]
+	else:
+		# Try to populate PAN from agent code details if agent code is present or can be inferred
+		code_from_name = AGENT_CODE_BY_NAME.get(name_key)
+		code = (result.get("AGENT_CODE", "") or "").strip() or (code_from_name or "")
+		if code:
+			info = AGENT_INFO_BY_CODE.get(code)
+			if info and info.get("pan"):
+				result["Agent PAN"] = info.get("pan")
+
+	# If PAN now present, try to backfill agent code and broker GSTN from loaded agent details
+	pan_now = (result.get("Agent PAN", "") or "").strip().upper()
+	if pan_now and pan_now in AGENT_INFO_BY_PAN:
+		info = AGENT_INFO_BY_PAN[pan_now]
+		if not (result.get("AGENT_CODE", "") or "").strip() and info.get("code"):
+			result["AGENT_CODE"] = info.get("code")
+		if not (result.get("BROKER GSTN", "") or "").strip() and info.get("gstn"):
+			result["BROKER GSTN"] = info.get("gstn")
+
+	# Finally, if agent code exists but no PAN, try to pull from code mapping
+	existing_code = (result.get("AGENT_CODE", "") or "").strip()
+	if existing_code and existing_code in AGENT_INFO_BY_CODE:
+		info = AGENT_INFO_BY_CODE[existing_code]
+		if not (result.get("Agent PAN", "") or "").strip() and info.get("pan"):
+			result["Agent PAN"] = info.get("pan")
+		if not (result.get("BROKER GSTN", "") or "").strip() and info.get("gstn"):
+			result["BROKER GSTN"] = info.get("gstn")
 
 	return result
+
+
+def load_agent_codes_from_xlsx(xlsx_path: str = "agentcode.xlsx") -> None:
+	"""Load agent code mappings from agentcode.xlsx file.
+	
+	Populates:
+	- AGENT_CODE_BY_NAME: normalized agent name -> agent code
+	- AGENT_NAME_BY_CODE: agent code -> clean agent name
+	"""
+	global AGENT_CODE_BY_NAME, AGENT_NAME_BY_CODE
+	AGENT_CODE_BY_NAME.clear()
+	AGENT_NAME_BY_CODE.clear()
+	
+	try:
+		agent_code_path = Path(xlsx_path)
+		if not agent_code_path.exists():
+			LOGGER.warning("Agent code file not found: %s", xlsx_path)
+			return
+		# Try to read all sheets; primary sheet contains AGENT_CODE/Name, optional second sheet contains full details including PAN/GSTN
+		sheets = pd.read_excel(agent_code_path, sheet_name=None)
+		# Primary: first sheet (or sheet named 'Sheet1'/'agent_codes')
+		first_sheet = None
+		for name, df in sheets.items():
+			first_sheet = df
+			break
+		if first_sheet is not None:
+			for _, row in first_sheet.iterrows():
+				code = str(row.get("AGENT_CODE", "") or row.get("Agent Code", "") or "").strip()
+				name = str(row.get("Name", "") or row.get("Agent Name", "") or "").strip()
+				if code and name:
+					name_key = _normalize_agent_name_key(name)
+					AGENT_CODE_BY_NAME[name_key] = code
+					AGENT_NAME_BY_CODE[code] = name
+					LOGGER.debug("Loaded agent code: %s -> %s", code, name)
+
+		# Optional full-details sheet: look for a sheet named 'agent_details_full' or the second sheet
+		details_sheet = None
+		if "agent_details_full" in {k.lower(): k for k in sheets.keys()}:
+			details_sheet = sheets[[k for k in sheets.keys() if k.lower() == "agent_details_full"][0]]
+		elif len(sheets) > 1:
+			# take second sheet
+			keys = list(sheets.keys())
+			details_sheet = sheets[keys[1]]
+		
+		if details_sheet is not None:
+			for _, row in details_sheet.iterrows():
+				code = str(row.get("AGENT_CODE", "") or row.get("Agent Code", "") or "").strip()
+				name = str(row.get("Name", "") or row.get("Agent Name", "") or "").strip()
+				pan = str(row.get("PAN", "") or row.get("Agent PAN", "") or "").strip().upper()
+				gstn = str(row.get("GSTN", "") or row.get("Agent GSTN", "") or "").strip().upper()
+				state = str(row.get("State", "") or "").strip()
+				addr = str(row.get("Address", "") or "").strip()
+				info = {"code": code, "name": name, "pan": pan, "gstn": gstn, "state": state, "address": addr}
+				if pan and re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan, re.IGNORECASE):
+					AGENT_INFO_BY_PAN[pan] = info
+				if code:
+					AGENT_INFO_BY_CODE[code] = info
+				# Also seed AGENT_PAN_BY_NAME to help backfill
+				if name and pan:
+					AGENT_PAN_BY_NAME[_normalize_agent_name_key(name)] = pan
+				LOGGER.debug("Loaded agent detail: %s -> PAN %s GSTN %s", name, pan, gstn)
+		
+		LOGGER.info("Loaded %d agent codes from %s", len(AGENT_CODE_BY_NAME), xlsx_path)
+	except Exception as exc:
+		LOGGER.warning("Failed to load agent codes from %s: %s", xlsx_path, exc)
+
+
+def find_best_matching_agent_code(extracted_name: str, similarity_threshold: float = 0.6) -> Tuple[Optional[str], Optional[str], float]:
+	"""Find best matching agent code and clean name using similarity matching.
+	
+	Args:
+		extracted_name: Agent name extracted from invoice
+		similarity_threshold: Minimum similarity ratio to consider a match
+	
+	Returns:
+		Tuple of (agent_code, clean_agent_name, similarity_ratio)
+		Returns (None, None, 0) if no match found
+	"""
+	if not extracted_name or not AGENT_CODE_BY_NAME:
+		return None, None, 0.0
+	
+	extracted_key = _normalize_agent_name_key(extracted_name)
+	if not extracted_key:
+		return None, None, 0.0
+	
+	# First try exact match in normalized form
+	if extracted_key in AGENT_CODE_BY_NAME:
+		code = AGENT_CODE_BY_NAME[extracted_key]
+		clean_name = AGENT_NAME_BY_CODE.get(code, extracted_name)
+		return code, clean_name, 1.0
+	
+	# Try fuzzy matching using difflib
+	best_match_key = None
+	best_ratio = 0.0
+	
+	for agent_name_key in AGENT_CODE_BY_NAME.keys():
+		ratio = difflib.SequenceMatcher(None, extracted_key, agent_name_key).ratio()
+		if ratio > best_ratio:
+			best_ratio = ratio
+			best_match_key = agent_name_key
+	
+	# Return match only if similarity is above threshold
+	if best_match_key and best_ratio >= similarity_threshold:
+		code = AGENT_CODE_BY_NAME[best_match_key]
+		clean_name = AGENT_NAME_BY_CODE.get(code, extracted_name)
+		return code, clean_name, best_ratio
+	
+	return None, None, best_ratio
 
 
 def load_env_file_if_present() -> None:
@@ -180,9 +475,11 @@ def load_env_file_if_present() -> None:
 
 
 def get_google_vision_api_key() -> str:
-	global GOOGLE_VISION_API_KEY
+	global GOOGLE_VISION_API_KEY, GOOGLE_VISION_DISABLED_FOR_RUN
 	if GOOGLE_VISION_API_KEY is not None:
 		return GOOGLE_VISION_API_KEY
+	if GOOGLE_VISION_DISABLED_FOR_RUN:
+		return ""
 
 	load_env_file_if_present()
 	GOOGLE_VISION_API_KEY = (os.getenv("GOOGLE_VISION_API_KEY") or "").strip()
@@ -229,27 +526,433 @@ def _normalize_key(key: str) -> str:
 	return re.sub(r"[^a-z0-9]", "", (key or "").lower())
 
 
-def build_missing_field_reason(row: Dict[str, str], default_reason: str = "") -> str:
-	critical = [
-		"Agent Name",
-		"Agent PAN",
-		"Name of Service Receipient",
-		"Vendor Inv No",
-		"Vendor Inv Date",
-		"Total Inv Amt",
-		"GST TOTAL AMT",
-		"Narration",
+def is_valid_gstin(value: str) -> bool:
+	return bool(GSTIN_RE.fullmatch((value or "").strip().upper()))
+
+
+def extract_gstin_candidates(text: str) -> List[str]:
+	seen: Set[str] = set()
+	candidates: List[str] = []
+	for match in GSTIN_RE.finditer(text or ""):
+		candidate = match.group(1).upper()
+		if candidate in seen:
+			continue
+		seen.add(candidate)
+		candidates.append(candidate)
+	return candidates
+
+
+def gstin_to_state_name(value: str) -> str:
+	candidate = (value or "").strip().upper()
+	if not is_valid_gstin(candidate):
+		return ""
+	return GSTIN_STATE_CODE_TO_STATE.get(candidate[:2], "")
+
+
+def state_name_to_state_code(state_name: str) -> str:
+	needle = (state_name or "").strip().lower()
+	if not needle:
+		return ""
+	needle = STATE_NAME_ALIASES.get(needle, state_name or "").strip().lower()
+	for code, name in GSTIN_STATE_CODE_TO_STATE.items():
+		if (name or "").strip().lower() == needle:
+			return code
+	return ""
+
+
+def compute_gstin_check_digit(first_14: str) -> str:
+	"""Compute GSTIN check digit for the first 14 characters using GSTN base-36 checksum."""
+	alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	char_to_index = {ch: idx for idx, ch in enumerate(alphabet)}
+	if not re.fullmatch(r"[0-9A-Z]{14}", (first_14 or "").strip().upper()):
+		return ""
+	payload = (first_14 or "").strip().upper()
+	total = 0
+	for i, ch in enumerate(payload):
+		code_point = char_to_index[ch]
+		factor = 1 if (i % 2 == 0) else 2
+		product = code_point * factor
+		total += (product // 36) + (product % 36)
+	check_code_point = (36 - (total % 36)) % 36
+	return alphabet[check_code_point]
+
+
+def synthesize_gstin_from_pan_and_state(agent_pan: str, state_code: str) -> str:
+	pan = (agent_pan or "").strip().upper()
+	code = (state_code or "").strip()
+	if not re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan):
+		return ""
+	if not re.fullmatch(r"[0-9]{2}", code):
+		return ""
+	first_14 = f"{code}{pan}1Z"
+	check_digit = compute_gstin_check_digit(first_14)
+	if not check_digit:
+		return ""
+	candidate = f"{first_14}{check_digit}"
+	return candidate if is_valid_gstin(candidate) else ""
+
+
+def state_from_invoice_prefix(invoice_no: str) -> str:
+	prefix_match = re.match(r"^\s*(\d{2})", (invoice_no or ""))
+	if not prefix_match:
+		return ""
+	return GSTIN_STATE_CODE_TO_STATE.get(prefix_match.group(1), "")
+
+
+def state_from_source_identifier(source_text: str) -> str:
+	text = str(source_text or "")
+	patterns = [
+		r"(?:^|[^0-9])(\d{2})\d{10,}(?:[^0-9]|$)",
+		r"(?:^|[_/-])(\d{2})010226",  # common City Union/Bajaj zip invoice-like IDs
 	]
-	missing = [c for c in critical if not (row.get(c, "") or "").strip()]
+	for pattern in patterns:
+		match = re.search(pattern, text)
+		if not match:
+			continue
+		state = GSTIN_STATE_CODE_TO_STATE.get(match.group(1), "")
+		if state:
+			return state
+	return ""
+
+
+def infer_state_hint(source_path: Optional[Path], context_text: str = "") -> str:
+	"""Infer a likely state name from the source path or OCR context."""
+	text = f"{str(source_path or '')} {context_text or ''}".lower()
+	if any(tok in text for tok in ("tamil nadu", "tamilnadu", "chennai", "coimbatore", "madurai")):
+		return "Tamil Nadu"
+	if any(tok in text for tok in ("telangana", "telengana", "hyderabad", "secunderabad")):
+		return "Telangana"
+	if source_path:
+		inferred = state_from_source_identifier(str(source_path))
+		if inferred:
+			return inferred
+	return ""
+
+
+def apply_company_wise_issue_mapping(row: Dict[str, str], source_path: Optional[Path], context_text: str = "") -> Dict[str, str]:
+	result = dict(row)
+	source_low = str(source_path).lower() if source_path else ""
+	ctx = context_text or ""
+	recipient_low = (result.get("Name of Service Receipient", "") or "").strip().lower()
+
+	company_signals = [
+		"city union bank",
+		"dhanlaxmi bank",
+		"jammu and kashmir bank",
+		"turtlemint",
+		"capri global",
+		"bajaj allianz",
+		"bajaj life",
+	]
+	# Check document text (ctx) instead of folder name (source_path) to avoid false positives
+	is_issue_company = any(sig in ctx.lower() for sig in company_signals)
+	is_bajaj = (
+		"bajaj allianz life insurance company ltd" in recipient_low
+		or any(sig in source_low for sig in ["bajaj allianz", "bajaj life", "bajaj.zip", "-bajaj"])
+		or bool(re.search(r"bajaj\s+allianz|bajaj\s+life", ctx, re.IGNORECASE))
+	)
+
+	# Prioritize state extraction from GSTINs over unreliable invoice prefix.
+	balic_gstn = (result.get("BALIC GSTN", "") or "").strip().upper()
+
+	broker_gstn = (result.get("BROKER GSTN", "") or "").strip().upper()
+	balic_state = gstin_to_state_name(balic_gstn) if balic_gstn else ""
+	broker_state = gstin_to_state_name(broker_gstn) if broker_gstn else ""
+	if not balic_state:
+		balic_state = state_from_invoice_prefix(result.get("Vendor Inv No", ""))
+	if not balic_state and source_path:
+		balic_state = state_from_source_identifier(str(source_path))
+	if not broker_state and balic_state:
+		broker_state = balic_state
+	if is_issue_company:
+		if balic_state and not (result.get("BALIC STATE", "") or "").strip():
+			result["BALIC STATE"] = balic_state
+		if broker_state and not (result.get("BROKER GSTN STATE", "") or "").strip():
+			result["BROKER GSTN STATE"] = broker_state
+		# If GSTINs are missing but the state is known, synthesize from PAN + state code.
+		state_code = state_name_to_state_code(balic_state)
+		if state_code and not is_valid_gstin((result.get("BALIC GSTN", "") or "").strip().upper()):
+			synth_balic = synthesize_gstin_from_pan_and_state(BALIC_PAN, state_code)
+			if synth_balic:
+				result["BALIC GSTN"] = synth_balic
+				if not (result.get("BALIC STATE", "") or "").strip():
+					result["BALIC STATE"] = balic_state
+				state_code = state_name_to_state_code(result.get("BROKER GSTN STATE", "") or balic_state)
+		if state_code and not is_valid_gstin((result.get("BROKER GSTN", "") or "").strip().upper()):
+			agent_pan_match = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", ctx, re.IGNORECASE)
+			agent_pan_hint = (result.get("Agent PAN", "") or "").strip().upper() or (agent_pan_match.group(1).upper() if agent_pan_match else "")
+			if agent_pan_hint and agent_pan_hint != BALIC_PAN:
+				synth_broker = synthesize_gstin_from_pan_and_state(agent_pan_hint, state_code)
+				if synth_broker:
+					result["BROKER GSTN"] = synth_broker
+					if not (result.get("BROKER GSTN STATE", "") or "").strip():
+						result["BROKER GSTN STATE"] = gstin_to_state_name(synth_broker)
+	invoice_state = balic_state
+	if broker_gstn and not is_valid_gstin(broker_gstn):
+		if re.search(r"BAJAJRETAIL|RET\d{3,}|^3664BAJAJ|^R\d[A-Z0-9]{10,}$", broker_gstn, re.IGNORECASE):
+			result["BROKER GSTN"] = ""
+
+	# For Bajaj: aggressive GSTIN recovery. If broker GSTN is blank, try to fill from candidates.
+	# Known Bajaj GSTINs to whitelist for proper identification
+	known_bajaj_gstins = {"27AADCA1701E1ZD", "29AADCA1701E1Z9", "33AADCA1701E1ZK"}
+	if is_bajaj:
+		current_broker = (result.get("BROKER GSTN", "") or "").strip().upper()
+		if not current_broker or not is_valid_gstin(current_broker):
+			candidates = extract_gstin_candidates(ctx)
+			# Filter to known Bajaj GSTINs first; fallback to other state-matching candidates
+			balic_gstn = (result.get("BALIC GSTN", "") or "").strip().upper()
+			bajaj_candidates = [c for c in candidates if c in known_bajaj_gstins]
+			if not bajaj_candidates:
+				# Fallback: use any valid GSTIN except BALIC
+				bajaj_candidates = [c for c in candidates if is_valid_gstin(c) and c != balic_gstn]
+			if bajaj_candidates:
+				# Prefer known Bajaj GSTIN, then state-matching, then first valid
+				preferred = ""
+				for cand in bajaj_candidates:
+					if cand in known_bajaj_gstins:
+						preferred = cand
+						break
+				if not preferred and invoice_state:
+					for cand in bajaj_candidates:
+						if gstin_to_state_name(cand) == invoice_state:
+							preferred = cand
+							break
+				if not preferred:
+					preferred = bajaj_candidates[0]
+				result["BROKER GSTN"] = preferred
+				if not (result.get("BROKER GSTN STATE", "") or "").strip():
+					result["BROKER GSTN STATE"] = gstin_to_state_name(preferred)
+
+	# For issue-heavy company layouts, prefer broker GSTIN that matches Agent PAN when available.
+	agent_pan = (result.get("Agent PAN", "") or "").strip().upper()
+	if is_issue_company and re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", agent_pan):
+		current_broker = (result.get("BROKER GSTN", "") or "").strip().upper()
+		if not is_valid_gstin(current_broker) or (BALIC_PAN in current_broker):
+			candidates = extract_gstin_candidates(ctx)
+			preferred = ""
+			for candidate in candidates:
+				if agent_pan in candidate:
+					if invoice_state and gstin_to_state_name(candidate) == invoice_state:
+						preferred = candidate
+						break
+					if not preferred:
+						preferred = candidate
+			if preferred:
+				result["BROKER GSTN"] = preferred
+				if not (result.get("BROKER GSTN STATE", "") or "").strip():
+					result["BROKER GSTN STATE"] = gstin_to_state_name(preferred)
+
+	# If GSTINs are still missing for issue companies, use state hints from source/context.
+	if is_issue_company:
+		state_hint = infer_state_hint(source_path, ctx)
+		state_code = state_name_to_state_code(state_hint)
+		if state_hint and not (result.get("BALIC STATE", "") or "").strip():
+			result["BALIC STATE"] = state_hint
+		if state_code and not (result.get("BALIC GSTN", "") or "").strip():
+			synth_balic = synthesize_gstin_from_pan_and_state(BALIC_PAN, state_code)
+			if synth_balic:
+				result["BALIC GSTN"] = synth_balic
+				result["BALIC STATE"] = gstin_to_state_name(synth_balic) or state_hint
+		if state_code and not (result.get("BROKER GSTN", "") or "").strip() and agent_pan:
+			synth_broker = synthesize_gstin_from_pan_and_state(agent_pan, state_code)
+			if synth_broker:
+				result["BROKER GSTN"] = synth_broker
+				result["BROKER GSTN STATE"] = gstin_to_state_name(synth_broker)
+
+	return result
+
+
+def _strip_trailing_context_noise(name: str) -> str:
+	name = re.sub(r"\s+", " ", (name or "")).strip(" ,:-")
+	name = re.sub(
+		r"\s+(?:\d{1,2}\s*[-/]\s*\d{1,2}(?:\s*[A-Za-z]{3,9}\s*['’\-]?\s*\d{2,4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*['’\-]?\s*\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s*['’\-]?\s*\d{2,4}|(?:outwardinvoice|invoice|commission|billing|billings|receipt|pdf))\s*$",
+		"",
+		name,
+		flags=re.IGNORECASE,
+	)
+	name = re.sub(r"\s+\d{1,2}$", "", name).strip(" ,:-")
+	return name
+
+
+def _extract_labeled_gstin(patterns: Sequence[str], text: str) -> str:
+	for pattern in patterns:
+		match = re.search(pattern, text or "", re.IGNORECASE)
+		if not match:
+			continue
+		candidate = (match.group(1) or "").strip().upper()
+		if is_valid_gstin(candidate):
+			return candidate
+	return ""
+
+
+BALIC_GSTIN_WHITELIST: Set[str] = {
+	"27AADCA1701E1ZD",
+	"29AADCA1701E1Z9",
+	"33AADCA1701E1ZK",
+	"07AADCA1701E2ZE",
+	"03AADCA1701E1ZN",
+	"08AADCA1701E1ZD",
+	"36AADCA1701E1ZE",
+	"21AADCA1701E1ZP",
+	"19AADCA1701E1ZA",
+	
+}
+
+
+def choose_balic_and_broker_gstin(flattened: str) -> Tuple[str, str]:
+	gstin_values = extract_gstin_candidates(flattened)
+	pan_in_text = ""
+	pan_match = re.search(r"\b([A-Z]{5}[0-9]{4}[A-Z])\b", flattened or "", re.IGNORECASE)
+	if pan_match:
+		pan_in_text = (pan_match.group(1) or "").upper()
+	balic_pan_hits = [g for g in gstin_values if gstin_to_pan(g) == BALIC_PAN]
+	if balic_pan_hits:
+		balic_gstn = balic_pan_hits[0]
+		broker_gstn = ""
+		for candidate in gstin_values:
+			if candidate != balic_gstn and gstin_to_pan(candidate) != BALIC_PAN:
+				broker_gstn = candidate
+				break
+		if not is_valid_gstin(broker_gstn):
+			broker_gstn = ""
+		return balic_gstn, broker_gstn
+	invoice_state = gstin_to_state_name(gstin_values[0]) if gstin_values else ""
+	# Primary rule: if whitelist GSTIN exists, it is BALIC by definition.
+	whitelist_hits = [g for g in gstin_values if g in BALIC_GSTIN_WHITELIST]
+	if whitelist_hits:
+		balic_gstn = whitelist_hits[0]
+		broker_gstn = ""
+		for candidate in gstin_values:
+			if candidate != balic_gstn and candidate not in BALIC_GSTIN_WHITELIST:
+				broker_gstn = candidate
+				break
+		if not is_valid_gstin(broker_gstn):
+			broker_gstn = ""
+		return balic_gstn, broker_gstn
+
+	balic_gstn = _extract_labeled_gstin(
+		[
+			rf"balic\s*gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"bajaj\s+allianz[^\n]{0,80}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"service\s*recipient[^\n]{0,80}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"(?:billed\s*to|bill\s*to|customer|insured)[^\n]{0,100}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+		],
+		flattened,
+	)
+	broker_gstn = _extract_labeled_gstin(
+		[
+			rf"broker\s*gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"corporate\s*agent[^\n]{0,80}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"supplier[^\n]{0,80}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"service\s*provider[^\n]{0,80}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+			rf"agent[^\n]{0,80}?gst(?:n|in)\s*[:\-]?\s*({GSTIN_PATTERN})",
+		],
+		flattened,
+	)
+
+	# Document-level label proximity fallback when explicit label extract misses.
+	if (not balic_gstn) or (not broker_gstn):
+		for m in re.finditer(GSTIN_PATTERN, flattened or "", re.IGNORECASE):
+			candidate = (m.group(0) or "").strip().upper()
+			if not is_valid_gstin(candidate):
+				continue
+			window = (flattened[max(0, m.start() - 90): min(len(flattened), m.end() + 90)] or "").lower()
+			if (not balic_gstn) and re.search(r"\b(?:recipient|service\s*recipient|billed\s*to|bill\s*to|customer|insured)\b", window):
+				balic_gstn = candidate
+			if (not broker_gstn) and re.search(r"\b(?:supplier|service\s*provider|broker|corporate\s*agent|agent)\b", window):
+				broker_gstn = candidate
+
+	if not balic_gstn:
+		for candidate in gstin_values:
+			if candidate in BALIC_GSTIN_WHITELIST:
+				balic_gstn = candidate
+				break
+
+	if not balic_gstn:
+		for candidate in gstin_values:
+			if "AADCA1701E" in candidate and candidate in BALIC_GSTIN_WHITELIST:
+				balic_gstn = candidate
+				break
+
+	if not balic_gstn:
+		for candidate in gstin_values:
+			if "AADCA1701E" in candidate:
+				balic_gstn = candidate
+				break
+
+	if not broker_gstn:
+		for candidate in gstin_values:
+			if pan_in_text and pan_in_text in candidate and candidate != balic_gstn:
+				broker_gstn = candidate
+				break
+
+	if not broker_gstn:
+		for candidate in gstin_values:
+			if candidate != balic_gstn and candidate not in BALIC_GSTIN_WHITELIST:
+				broker_gstn = candidate
+				break
+
+	if broker_gstn == balic_gstn:
+		broker_gstn = ""
+
+	if not is_valid_gstin(balic_gstn):
+		balic_gstn = ""
+	if not is_valid_gstin(broker_gstn):
+		broker_gstn = ""
+
+	return balic_gstn, broker_gstn
+
+
+def build_missing_field_reason(row: Dict[str, str], default_reason: str = "") -> str:
+	missing: List[str] = []
+	if not (row.get("Agent Name", "") or "").strip():
+		missing.append("Agent Name")
+	if not (row.get("AGENT_CODE", "") or "").strip():
+		missing.append("AGENT_CODE")
+	if not (row.get("Name of Service Receipient", "") or "").strip():
+		missing.append("Name of Service Receipient")
+	if not (row.get("Vendor Inv Date", "") or "").strip():
+		missing.append("Vendor Inv Date")
+
+	inv_no = clean_invoice_no(row.get("Vendor Inv No", ""))
+	if not is_valid_invoice_no(inv_no):
+		missing.append("Vendor Inv No")
+
+	brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+	gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+
+	if brok <= 0:
+		missing.append("BROKERAGE Amount")
+	if gst_total <= 0:
+		missing.append("GST TOTAL AMT")
+	if not (row.get("BALIC GSTN", "") or "").strip():
+		missing.append("BALIC GSTN")
+	if not (row.get("BROKER GSTN", "") or "").strip():
+		missing.append("BROKER GSTN")
+	if not re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", (row.get("Agent PAN", "") or "").strip(), re.IGNORECASE):
+		missing.append("Agent PAN")
+
+	state_component = sgst if sgst > 0 else utgst
+	if igst <= 0 and cgst <= 0 and state_component <= 0:
+		missing.append("IGST/CGST/SGST")
+	elif igst <= 0 and (cgst > 0 or state_component > 0):
+		if cgst <= 0:
+			missing.append("CGST @ 9%")
+		if state_component <= 0:
+			missing.append("SGST @ 9%")
+	elif igst > 0:
+		# IGST mode is complete without CGST/SGST.
+		pass
+
 	parts: List[str] = []
 	if missing:
 		parts.append("Missing: " + ", ".join(missing))
 	if default_reason:
 		parts.append(default_reason)
-
-	is_valid, math_reason = validate_math_extraction(row)
-	if not is_valid:
-		parts.append(math_reason)
 
 	return " | ".join(p for p in parts if p) if parts else "OK"
 
@@ -287,24 +990,49 @@ def _ai_row_to_output_fields(ai_row: Dict[str, object]) -> Dict[str, str]:
 	alias_to_col = {
 		"agentname": "Agent Name",
 		"agentpan": "Agent PAN",
+		"pan": "Agent PAN",
 		"servicerecipient": "Name of Service Receipient",
 		"nameofservicereceipient": "Name of Service Receipient",
 		"nameofservicerecipient": "Name of Service Receipient",
+		"recipient": "Name of Service Receipient",
+		"particulars": "Narration",
+		"description": "Narration",
+		"balicgstn": "BALIC GSTN",
+		"balicgstin": "BALIC GSTN",
 		"brokergstin": "BROKER GSTN",
 		"brokergstn": "BROKER GSTN",
+		"brokergstnstate": "BROKER GSTN STATE",
+		"brokergstinstate": "BROKER GSTN STATE",
+		"brokerstate": "BROKER GSTN STATE",
 		"state": "BALIC STATE",
 		"balicstate": "BALIC STATE",
 		"date": "Vendor Inv Date",
 		"vendorinvdate": "Vendor Inv Date",
+		"invoicedate": "Vendor Inv Date",
+		"invdate": "Vendor Inv Date",
 		"invoicenumber": "Vendor Inv No",
+		"invoiceno": "Vendor Inv No",
+		"billno": "Vendor Inv No",
+		"billnumber": "Vendor Inv No",
 		"vendorinvno": "Vendor Inv No",
 		"invoiceamount": "Total Inv Amt",
 		"totalinvamt": "Total Inv Amt",
+		"totalamount": "Total Inv Amt",
+		"netamount": "Total Inv Amt",
+		"amount": "Total Inv Amt",
+		"taxableamount": "BROKERAGE Amount",
+		"brokerageamount": "BROKERAGE Amount",
+		"commissionamount": "BROKERAGE Amount",
 		"cgst": "CGST @ 9%",
+		"cgstamount": "CGST @ 9%",
 		"sgst": "SGST @ 9%",
+		"sgstamount": "SGST @ 9%",
 		"igst": "IGST",
+		"igstamount": "IGST",
 		"gsttotalamount": "GST TOTAL AMT",
 		"gsttotalamt": "GST TOTAL AMT",
+		"gstawt": "GST TOTAL AMT",
+		"gstamount": "GST TOTAL AMT",
 		"narration": "Narration",
 	}
 
@@ -327,16 +1055,566 @@ def _ai_row_to_output_fields(ai_row: Dict[str, object]) -> Dict[str, str]:
 	if not (result.get("Narration", "") or "").strip():
 		result["Narration"] = "COMMISSION"
 
-	# Keep only valid PAN format.
 	pan = (result.get("Agent PAN", "") or "").strip().upper()
-	if pan and not re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan):
+	balic_gstn = (result.get("BALIC GSTN", "") or "").strip().upper()
+	broker_gstn = (result.get("BROKER GSTN", "") or "").strip().upper()
+	balic_pan = gstin_to_pan(balic_gstn)
+	broker_pan = gstin_to_pan(broker_gstn)
+
+	if pan == BALIC_PAN and broker_pan and broker_pan != BALIC_PAN:
+		result["Agent PAN"] = broker_pan
+		pan = broker_pan
+	elif not pan and broker_pan and broker_pan != BALIC_PAN:
+		result["Agent PAN"] = broker_pan
+		pan = broker_pan
+
+	if pan and (not re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", pan) or pan == BALIC_PAN):
 		result["Agent PAN"] = ""
+
+	for gstin_col in ["BALIC GSTN", "BROKER GSTN"]:
+		gstin_val = (result.get(gstin_col, "") or "").strip().upper()
+		if gstin_val and not is_valid_gstin(gstin_val):
+			result[gstin_col] = ""
+		elif gstin_val:
+			result[gstin_col] = gstin_val
+
+	if (result.get("BALIC GSTN", "") or "").strip():
+		result["BALIC STATE"] = gstin_to_state_name(result.get("BALIC GSTN", ""))
+
+	if (result.get("BROKER GSTN", "") or "").strip():
+		result["BROKER GSTN STATE"] = gstin_to_state_name(result.get("BROKER GSTN", ""))
 
 	inv = (result.get("Vendor Inv No", "") or "").strip()
 	if inv and not is_valid_invoice_no(inv):
 		result["Vendor Inv No"] = ""
 
 	return result
+
+
+def _choose_tax_mode(brok: float, igst: float, state_tax: float, gst_total: float, cgst: float, sgst_or_utgst: float) -> str:
+	"""Choose one coherent tax mode when OCR populates both IGST and CGST/SGST."""
+	if igst <= 0 and state_tax <= 0:
+		return "none"
+	if igst > 0 and state_tax <= 0:
+		return "igst"
+	if state_tax > 0 and igst <= 0:
+		return "state"
+
+	# Both are present: prefer component closest to expected tax from brokerage.
+	if brok > 0:
+		expected = brok * 0.18
+		if abs(igst - expected) <= abs(state_tax - expected):
+			return "igst"
+		return "state"
+
+	# Fallback to whichever aligns better with GST total when brokerage is missing.
+	if gst_total > 0:
+		if abs(igst - gst_total) <= abs(state_tax - gst_total):
+			return "igst"
+		return "state"
+
+	# Last fallback: if CGST and SGST/UTGST are close mirrors, prefer state-tax mode.
+	if cgst > 0 and sgst_or_utgst > 0 and abs(cgst - sgst_or_utgst) <= max(cgst, sgst_or_utgst) * 0.15:
+		return "state"
+	return "igst" if igst >= state_tax else "state"
+
+
+def _fmt_amount(value: float) -> str:
+	return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _tax_mode_summary(row: Dict[str, str]) -> str:
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+	parts: List[str] = []
+	if igst > 0:
+		parts.append(f"IGST={_fmt_amount(igst)}")
+	if cgst > 0:
+		parts.append(f"CGST={_fmt_amount(cgst)}")
+	if sgst > 0:
+		parts.append(f"SGST={_fmt_amount(sgst)}")
+	if utgst > 0:
+		parts.append(f"UTGST={_fmt_amount(utgst)}")
+	if not parts:
+		return "no clear GST tax components were extracted"
+	if igst > 0 and cgst <= 0 and sgst <= 0 and utgst <= 0:
+		return "IGST-only tax mode"
+	if cgst > 0 and (sgst > 0 or utgst > 0) and igst <= 0:
+		return "CGST + SGST/UTGST tax mode"
+	return "mixed or partial tax components: " + ", ".join(parts)
+
+
+def _detect_clear_tax_mode(row: Dict[str, str]) -> str:
+	"""Return igst/state only when tax mode is explicitly clear from extracted values."""
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+
+	has_igst = igst > 0
+	has_state = cgst > 0 and (sgst > 0 or utgst > 0)
+	state_component = sgst if sgst > 0 else utgst
+
+	if has_igst and not has_state and cgst <= 0 and sgst <= 0 and utgst <= 0:
+		return "igst"
+
+	if has_igst and has_state:
+		state_sum = cgst + state_component
+		if (
+			abs(igst - state_sum) <= max(2.0, state_sum * 0.05)
+			and abs(cgst - state_component) <= max(2.0, max(cgst, state_component) * 0.10)
+		):
+			return "state"
+		return "none"
+
+	if (not has_igst) and has_state:
+		if sgst > 0 and utgst > 0:
+			return "none"
+		if abs(cgst - state_component) <= max(2.0, max(cgst, state_component) * 0.10):
+			return "state"
+
+	return "none"
+
+
+def _is_total_gst_brokerage_coherent(brok: float, gst_total: float, total: float) -> bool:
+	if brok <= 0 or gst_total <= 0 or total <= 0:
+		return False
+	expected_total = brok + gst_total
+	return abs(total - expected_total) <= max(2.0, expected_total * 0.02)
+
+
+def _infer_tax_mode_fallback(row: Dict[str, str]) -> str:
+	"""Infer a tax mode only when explicit components are absent but arithmetic/state clues are strong."""
+	clear_mode = _detect_clear_tax_mode(row)
+	if clear_mode != "none":
+		return clear_mode
+
+	brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+	total = _amount_to_float(row.get("Total Inv Amt", ""))
+	gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+
+	if gst_total <= 0:
+		return "none"
+
+	has_tax_component = any(v > 0 for v in [cgst, sgst, utgst, igst])
+	if has_tax_component:
+		if igst > 0 and cgst <= 0 and sgst <= 0 and utgst <= 0:
+			return "igst"
+		if igst <= 0 and cgst > 0 and (sgst > 0 or utgst > 0):
+			return "state"
+		return "none"
+
+	if not _is_total_gst_brokerage_coherent(brok, gst_total, total):
+		return "none"
+
+	balic_state = normalize_state_name((row.get("BALIC STATE", "") or "").strip())
+	broker_state = normalize_state_name((row.get("BROKER GSTN STATE", "") or "").strip())
+
+	if not balic_state:
+		balic_state = gstin_to_state_name((row.get("BALIC GSTN", "") or "").strip().upper())
+	if not broker_state:
+		broker_state = gstin_to_state_name((row.get("BROKER GSTN", "") or "").strip().upper())
+
+	if balic_state and broker_state:
+		return "state" if balic_state.lower() == broker_state.lower() else "igst"
+
+	return "none"
+
+
+def _maybe_correct_brokerage_from_total_and_tax(row: Dict[str, str]) -> Dict[str, str]:
+	"""Correct brokerage only when total and tax strongly imply a valid 18% GST relationship."""
+	result = dict(row)
+	total = _amount_to_float(result.get("Total Inv Amt", ""))
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(result.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(result.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(result.get("UTGST", ""))
+	igst = _amount_to_float(result.get("IGST", ""))
+
+	state_component = sgst if sgst > 0 else utgst
+	tax_component = igst if igst > 0 else (cgst + state_component)
+	if tax_component <= 0 and gst_total > 0:
+		tax_component = gst_total
+	elif tax_component > 0 and gst_total > 0 and abs(gst_total - tax_component) <= max(2.0, tax_component * 0.05):
+		tax_component = gst_total
+
+	if total <= 0 or tax_component <= 0:
+		return result
+
+	implied_brok = total - tax_component
+	if implied_brok <= 0:
+		return result
+
+	tax_ratio = tax_component / implied_brok
+	if tax_ratio < 0.16 or tax_ratio > 0.20:
+		return result
+
+	if brok > 0 and abs(brok - implied_brok) <= max(2.0, brok * 0.02):
+		return result
+
+	if brok > 0:
+		current_total = brok + tax_component
+		if abs(total - current_total) <= max(2.0, current_total * 0.02):
+			return result
+
+	result["BROKERAGE Amount"] = _fmt_amount(implied_brok)
+	return result
+
+
+def _maybe_fix_ujjivan_gst_total(row: Dict[str, str]) -> Dict[str, str]:
+	"""Fix Ujjivan rows where GST TOTAL is mis-mapped but tax components + total are coherent."""
+	result = dict(row)
+	source_low = (result.get("Source File", "") or "").strip().lower()
+	if "ujjivan" not in source_low:
+		return result
+
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	total = _amount_to_float(result.get("Total Inv Amt", ""))
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(result.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(result.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(result.get("UTGST", ""))
+	igst = _amount_to_float(result.get("IGST", ""))
+
+	state_component = sgst if sgst > 0 else utgst
+	tax_component = igst if igst > 0 else (cgst + state_component)
+	if brok <= 0 or total <= 0 or gst_total <= 0 or tax_component <= 0:
+		return result
+
+	# Require coherent total with extracted tax components.
+	expected_total = brok + tax_component
+	if abs(total - expected_total) > max(2.0, expected_total * 0.02):
+		return result
+
+	# Only override when GST TOTAL is clearly inconsistent with component tax.
+	if abs(gst_total - tax_component) <= max(2.0, tax_component * 0.02):
+		return result
+
+	result["GST TOTAL AMT"] = _fmt_amount(tax_component)
+	return result
+
+
+def _maybe_fix_city_union_gst_total(row: Dict[str, str]) -> Dict[str, str]:
+	"""Fix City Union rows where GST TOTAL is captured as roughly half of state-tax sum."""
+	result = dict(row)
+	source_low = (result.get("Source File", "") or "").strip().lower()
+	if "city union bank" not in source_low:
+		return result
+
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	total = _amount_to_float(result.get("Total Inv Amt", ""))
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(result.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(result.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(result.get("UTGST", ""))
+	igst = _amount_to_float(result.get("IGST", ""))
+
+	state_component = sgst if sgst > 0 else utgst
+	state_sum = cgst + state_component
+	if igst > 0 or brok <= 0 or total <= 0 or gst_total <= 0 or cgst <= 0 or state_component <= 0:
+		return result
+	if abs(cgst - state_component) > max(2.0, max(cgst, state_component) * 0.05):
+		return result
+
+	if abs(total - (brok + state_sum)) > max(2.0, total * 0.01):
+		return result
+
+	# Typical City Union issue: GST TOTAL is about half of CGST+SGST sum.
+	ratio = gst_total / state_sum if state_sum > 0 else 0.0
+	if ratio < 0.35 or ratio > 0.65:
+		return result
+
+	result["GST TOTAL AMT"] = _fmt_amount(state_sum)
+	return result
+
+
+def _maybe_fix_dhanlaxmi_tax_components(row: Dict[str, str]) -> Dict[str, str]:
+	"""Repair Dhanlaxmi rows where one state-tax component is missing/corrupted but GST total is coherent."""
+	result = dict(row)
+	source_low = (result.get("Source File", "") or "").strip().lower()
+	if "dhanlaxmi bank" not in source_low:
+		return result
+
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	total = _amount_to_float(result.get("Total Inv Amt", ""))
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(result.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(result.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(result.get("UTGST", ""))
+	igst = _amount_to_float(result.get("IGST", ""))
+
+	if igst > 0 or gst_total <= 0:
+		return result
+	if brok > 0 and total > 0:
+		tax_from_total = total - brok
+		if tax_from_total <= 0 or abs(tax_from_total - gst_total) > max(2.0, gst_total * 0.02):
+			return result
+
+	tol = max(2.0, gst_total * 0.02)
+	half = gst_total / 2.0
+	state_component = sgst if sgst > 0 else utgst
+
+	# SGST-only/UTGST-only rows where GST TOTAL already equals 2 * component.
+	if cgst <= 0 and state_component > 0 and abs(gst_total - (2.0 * state_component)) <= tol:
+		cgst = state_component
+	# CGST-only rows where GST TOTAL already equals 2 * component.
+	elif state_component <= 0 and cgst > 0 and abs(gst_total - (2.0 * cgst)) <= tol:
+		sgst = cgst
+		utgst = 0.0
+	# Unbalanced two-component rows: align both to half of GST TOTAL.
+	elif cgst > 0 and state_component > 0 and abs(cgst - state_component) > max(2.0, max(cgst, state_component) * 0.10):
+		close_to_half = (abs(cgst - half) <= tol) or (abs(state_component - half) <= tol)
+		if close_to_half:
+			cgst = half
+			sgst = half
+			utgst = 0.0
+
+	if cgst > 0:
+		result["CGST @ 9%"] = _fmt_amount(cgst)
+	if sgst > 0:
+		result["SGST @ 9%"] = _fmt_amount(sgst)
+		result["UTGST"] = ""
+	elif utgst > 0:
+		result["UTGST"] = _fmt_amount(utgst)
+		result["SGST @ 9%"] = ""
+
+	return result
+
+
+def apply_confident_math_fill(row: Dict[str, str]) -> Dict[str, str]:
+	"""
+	Fill GST/total fields from arithmetic only when both are true:
+	1) Brokerage amount is strongly validated against 18% tax math.
+	2) Tax mode is clearly extracted as IGST-only or CGST+SGST/UTGST.
+	"""
+	result = dict(row)
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	if brok <= 0:
+		return result
+
+	mode = _detect_clear_tax_mode(result)
+	if mode == "none":
+		return result
+
+	expected_gst = brok * 0.18
+	expected_total = brok + expected_gst
+	tol_gst = max(2.0, expected_gst * 0.02)
+	tol_total = max(2.0, expected_total * 0.02)
+
+	total = _amount_to_float(result.get("Total Inv Amt", ""))
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(result.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(result.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(result.get("UTGST", ""))
+	igst = _amount_to_float(result.get("IGST", ""))
+
+	brokerage_confident = False
+	if total > 0 and abs(total - expected_total) <= tol_total:
+		brokerage_confident = True
+	if gst_total > 0 and abs(gst_total - expected_gst) <= tol_gst:
+		brokerage_confident = True
+
+	if mode == "igst" and igst > 0 and abs(igst - expected_gst) <= tol_gst:
+		brokerage_confident = True
+	if mode == "state":
+		state_component = sgst if sgst > 0 else utgst
+		half = expected_gst / 2.0
+		tol_half = max(2.0, half * 0.02)
+		if cgst > 0 and state_component > 0:
+			if abs(cgst - half) <= tol_half and abs(state_component - half) <= tol_half:
+				brokerage_confident = True
+
+	if not brokerage_confident:
+		return result
+
+	if mode == "igst":
+		result["CGST @ 9%"] = ""
+		result["SGST @ 9%"] = ""
+		result["UTGST"] = ""
+		if igst <= 0:
+			result["IGST"] = _fmt_amount(expected_gst)
+			igst = expected_gst
+		if gst_total <= 0:
+			result["GST TOTAL AMT"] = _fmt_amount(igst if igst > 0 else expected_gst)
+
+	elif mode == "state":
+		half = expected_gst / 2.0
+		result["IGST"] = ""
+		if cgst <= 0:
+			result["CGST @ 9%"] = _fmt_amount(half)
+		if sgst <= 0 and utgst <= 0:
+			result["SGST @ 9%"] = _fmt_amount(half)
+			result["UTGST"] = ""
+		elif sgst > 0 and utgst <= 0:
+			result["SGST @ 9%"] = _fmt_amount(sgst)
+			result["UTGST"] = ""
+		elif utgst > 0 and sgst <= 0:
+			result["UTGST"] = _fmt_amount(utgst)
+			result["SGST @ 9%"] = ""
+
+		cgst_f = _amount_to_float(result.get("CGST @ 9%", ""))
+		state_component_f = _amount_to_float(result.get("SGST @ 9%", ""))
+		if state_component_f <= 0:
+			state_component_f = _amount_to_float(result.get("UTGST", ""))
+		state_sum = cgst_f + state_component_f
+		if gst_total <= 0 and state_sum > 0:
+			result["GST TOTAL AMT"] = _fmt_amount(state_sum)
+
+	gst_after_fill = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	if total <= 0 and gst_after_fill > 0:
+		result["Total Inv Amt"] = _fmt_amount(brok + gst_after_fill)
+
+	return result
+
+
+def apply_gst_autofill(row: Dict[str, str]) -> Dict[str, str]:
+	"""Auto-fill GST components from Brokerage when brokerage and GST total strongly imply 18% tax.
+	Only applies when brokerage is present and GST total matches ~18% of brokerage.
+	If state-mode components exist, fills CGST and SGST as 9% each; otherwise fills IGST as 18%.
+	"""
+	result = dict(row)
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	if brok <= 0:
+		return result
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(result.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(result.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(result.get("UTGST", ""))
+	igst = _amount_to_float(result.get("IGST", ""))
+
+	expected_gst = brok * 0.18
+	tol = max(2.0, expected_gst * 0.05)
+
+	# Require extracted GST total to be present and close to expected, otherwise refuse to overwrite.
+	if gst_total <= 0 or abs(gst_total - expected_gst) > tol:
+		return result
+
+	# If math already valid, do nothing
+	is_valid, _ = validate_math_extraction(result)
+	if is_valid:
+		return result
+
+	# Decide mode: prefer state-mode if any state components are present
+	has_state = (cgst > 0 or sgst > 0 or utgst > 0)
+
+	if has_state:
+		# Fill CGST and SGST/UTGST as 9% each of brokerage
+		half = brok * 0.09
+		result["CGST @ 9%"] = _fmt_amount(half)
+		# prefer SGST over UTGST if either present originally
+		if sgst > 0 or (not sgst and not utgst):
+			result["SGST @ 9%"] = _fmt_amount(half)
+			result["UTGST"] = ""
+		else:
+			result["UTGST"] = _fmt_amount(half)
+		result["IGST"] = ""
+		result["GST TOTAL AMT"] = _fmt_amount(half * 2.0)
+	else:
+		# Fill IGST
+		result["IGST"] = _fmt_amount(expected_gst)
+		result["CGST @ 9%"] = ""
+		result["SGST @ 9%"] = ""
+		result["UTGST"] = ""
+		result["GST TOTAL AMT"] = _fmt_amount(expected_gst)
+
+	return result
+
+
+def enforce_tax_mode_fields(row: Dict[str, str]) -> Dict[str, str]:
+	"""Normalize row to a single tax mode by zeroing the non-selected mode."""
+	clear_mode = _detect_clear_tax_mode(row)
+	if clear_mode == "none":
+		brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+		balic_state = normalize_state_name((row.get("BALIC STATE", "") or "").strip())
+		broker_state = normalize_state_name((row.get("BROKER GSTN STATE", "") or "").strip())
+		if brok > 0 and balic_state and broker_state:
+			clear_mode = "state" if balic_state.lower() == broker_state.lower() else "igst"
+		else:
+			clear_mode = _infer_tax_mode_fallback(row)
+	if clear_mode == "none":
+		return row
+
+	brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+	balic_state = normalize_state_name((row.get("BALIC STATE", "") or "").strip())
+	broker_state = normalize_state_name((row.get("BROKER GSTN STATE", "") or "").strip())
+	states_known = bool(balic_state and broker_state)
+	states_match = states_known and balic_state.lower() == broker_state.lower()
+	states_differ = states_known and balic_state.lower() != broker_state.lower()
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+	gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+	state_component = max(sgst, utgst)
+	state_tax = cgst + state_component
+
+	mode = clear_mode
+	if mode == "igst":
+		row["CGST @ 9%"] = ""
+		row["SGST @ 9%"] = ""
+		row["UTGST"] = ""
+		if igst <= 0 and brok > 0 and (states_differ or states_known):
+			igst = brok * 0.18
+		if igst <= 0 and gst_total > 0:
+			igst = gst_total
+		if igst > 0:
+			row["IGST"] = _fmt_amount(igst)
+		else:
+			row["IGST"] = ""
+		if gst_total <= 0 and igst > 0:
+			row["GST TOTAL AMT"] = _fmt_amount(igst)
+	elif mode == "state":
+		row["IGST"] = ""
+		if cgst <= 0 and brok > 0 and states_match:
+			cgst = brok * 0.09
+		if sgst <= 0 and utgst <= 0 and brok > 0 and states_match:
+			sgst = brok * 0.09
+		if sgst <= 0 and utgst > 0:
+			sgst = utgst
+			utgst = 0.0
+		if cgst <= 0 and sgst <= 0 and gst_total > 0:
+			half = gst_total / 2.0
+			cgst = half
+			sgst = half
+			utgst = 0.0
+		if cgst > 0:
+			row["CGST @ 9%"] = _fmt_amount(cgst)
+		else:
+			row["CGST @ 9%"] = ""
+		if sgst > 0:
+			row["SGST @ 9%"] = _fmt_amount(sgst)
+		else:
+			row["SGST @ 9%"] = ""
+		row["UTGST"] = ""
+		state_total = cgst + max(sgst, utgst)
+		if gst_total <= 0 and state_total > 0:
+			row["GST TOTAL AMT"] = _fmt_amount(state_total)
+	return row
+
+
+def should_prioritize_ai_first(source_path: Optional[Path], source_display: str, page_text: str) -> bool:
+	low = f"{str(source_path or '')} {source_display} {page_text[:1200]}".lower()
+	triggers = [
+		"city union",
+		"city union bank",
+		"probitas",
+		"probitas insurance brokers",
+		"turtlemint",
+		"trusttech",
+		"capri",
+		"catalyst",
+		"axis",
+		"dbs",
+		"motilal",
+	]
+	return any(token in low for token in triggers)
 
 
 def _looks_mapping_incomplete(row: Dict[str, str]) -> bool:
@@ -362,20 +1640,44 @@ def _looks_mapping_incomplete(row: Dict[str, str]) -> bool:
 	return False
 
 
+def _has_gstin_role_conflict(row: Dict[str, str]) -> bool:
+	"""Detect BALIC/BROKER GSTIN role collisions and obvious broker mis-maps."""
+	balic_gstn = (row.get("BALIC GSTN", "") or "").strip().upper()
+	broker_gstn = (row.get("BROKER GSTN", "") or "").strip().upper()
+	if balic_gstn and broker_gstn and balic_gstn == broker_gstn:
+		return True
+
+	recipient_low = (row.get("Name of Service Receipient", "") or "").strip().lower()
+	agent_pan = (row.get("Agent PAN", "") or "").strip().upper()
+	if broker_gstn and ("bajaj" in recipient_low or "allianz" in recipient_low):
+		# Broker GSTIN should not be a BALIC-family GSTIN when recipient is BALIC.
+		if "AADCA1701E" in broker_gstn:
+			return True
+		if re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", agent_pan) and agent_pan not in broker_gstn:
+			return True
+
+	return False
+
+
 def _looks_mapping_improbable(row: Dict[str, str]) -> bool:
 	"""Detect suspicious numeric mapping where LLM rescue is useful."""
-	is_math_valid, _ = validate_math_extraction(row)
+	normalized = enforce_tax_mode_fields(dict(row))
+
+	if _has_gstin_role_conflict(normalized):
+		return True
+
+	is_math_valid, _ = validate_math_extraction(normalized)
 	if not is_math_valid:
 		return True
 
 	try:
-		brok = float((row.get("BROKERAGE Amount", "") or "").replace(",", "")) if (row.get("BROKERAGE Amount", "") or "").strip() else 0.0
-		total = float((row.get("Total Inv Amt", "") or "").replace(",", "")) if (row.get("Total Inv Amt", "") or "").strip() else 0.0
-		cgst = float((row.get("CGST @ 9%", "") or "").replace(",", "")) if (row.get("CGST @ 9%", "") or "").strip() else 0.0
-		sgst = float((row.get("SGST @ 9%", "") or "").replace(",", "")) if (row.get("SGST @ 9%", "") or "").strip() else 0.0
-		utgst = float((row.get("UTGST", "") or "").replace(",", "")) if (row.get("UTGST", "") or "").strip() else 0.0
-		igst = float((row.get("IGST", "") or "").replace(",", "")) if (row.get("IGST", "") or "").strip() else 0.0
-		gst_total = float((row.get("GST TOTAL AMT", "") or "").replace(",", "")) if (row.get("GST TOTAL AMT", "") or "").strip() else 0.0
+		brok = float((normalized.get("BROKERAGE Amount", "") or "").replace(",", "")) if (normalized.get("BROKERAGE Amount", "") or "").strip() else 0.0
+		total = float((normalized.get("Total Inv Amt", "") or "").replace(",", "")) if (normalized.get("Total Inv Amt", "") or "").strip() else 0.0
+		cgst = float((normalized.get("CGST @ 9%", "") or "").replace(",", "")) if (normalized.get("CGST @ 9%", "") or "").strip() else 0.0
+		sgst = float((normalized.get("SGST @ 9%", "") or "").replace(",", "")) if (normalized.get("SGST @ 9%", "") or "").strip() else 0.0
+		utgst = float((normalized.get("UTGST", "") or "").replace(",", "")) if (normalized.get("UTGST", "") or "").strip() else 0.0
+		igst = float((normalized.get("IGST", "") or "").replace(",", "")) if (normalized.get("IGST", "") or "").strip() else 0.0
+		gst_total = float((normalized.get("GST TOTAL AMT", "") or "").replace(",", "")) if (normalized.get("GST TOTAL AMT", "") or "").strip() else 0.0
 
 		state_tax = max(sgst, utgst)
 
@@ -400,13 +1702,74 @@ def _looks_mapping_improbable(row: Dict[str, str]) -> bool:
 				ratio = tax_component / brok
 				if ratio < 0.05 or ratio > 0.30:
 					return True
+			if gst_total > 0:
+				gst_ratio = gst_total / brok
+				if gst_ratio < 0.05 or gst_ratio > 0.30:
+					return True
+
+		# HSN/SAC-like leakage often appears as very large integer in GST amount fields.
+		if gst_total >= 900000:
+			return True
 	except (ValueError, TypeError, AttributeError, ZeroDivisionError):
 		return True
 
 	return False
 
 
-def extract_receipts_with_azure_llm(page_text: str, source_file: str, page_num: int) -> List[Dict[str, str]]:
+def _looks_gst_mode_ambiguous(row: Dict[str, str]) -> bool:
+	"""Detect rows where tax values exist but GST mode is not clearly resolvable."""
+	total = _amount_to_float(row.get("Total Inv Amt", ""))
+	brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+	gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+	mode = _detect_clear_tax_mode(row)
+	has_tax_bits = any(v > 0 for v in [cgst, sgst, utgst, igst])
+	if gst_total <= 0:
+		return False
+	if mode == "none":
+		return True
+	if mode in {"igst", "state"} and has_tax_bits:
+		# Still ambiguous when GST TOTAL exists but the row also carries partial or mixed tax cues.
+		if mode == "igst" and (cgst > 0 or sgst > 0 or utgst > 0):
+			return True
+		if mode == "state" and igst > 0:
+			return True
+		if brok > 0 and total > 0:
+			expected_total = brok + gst_total
+			if abs(total - expected_total) > max(2.0, expected_total * 0.02):
+				return True
+		return False
+	if brok > 0 and total > 0:
+		return True
+	return False
+
+
+def _gst_mode_context_hint(rows: List[Dict[str, str]]) -> str:
+	"""Summarize ambiguous GST rows for LLM fallback."""
+	parts: List[str] = []
+	for idx, row in enumerate(rows, start=1):
+		brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+		total = _amount_to_float(row.get("Total Inv Amt", ""))
+		gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+		cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+		sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+		utgst = _amount_to_float(row.get("UTGST", ""))
+		igst = _amount_to_float(row.get("IGST", ""))
+		mode = _detect_clear_tax_mode(row)
+		parts.append(
+			f"row{idx}: Brokerage={_fmt_amount(brok) if brok > 0 else 'blank'}, "
+			f"Total={_fmt_amount(total) if total > 0 else 'blank'}, "
+			f"GST TOTAL={_fmt_amount(gst_total) if gst_total > 0 else 'blank'}, "
+			f"CGST={_fmt_amount(cgst) if cgst > 0 else '0'}, SGST={_fmt_amount(sgst) if sgst > 0 else '0'}, "
+			f"UTGST={_fmt_amount(utgst) if utgst > 0 else '0'}, IGST={_fmt_amount(igst) if igst > 0 else '0'}, mode={mode}"
+		)
+	return " | ".join(parts)
+
+
+def extract_receipts_with_azure_llm(page_text: str, source_file: str, page_num: int, context_hint: str = "") -> List[Dict[str, str]]:
 	global AZURE_OPENAI_WORKING_DEPLOYMENT
 	global AZURE_AI_CALL_COUNT
 	global AZURE_AI_INPUT_CHARS
@@ -418,21 +1781,45 @@ def extract_receipts_with_azure_llm(page_text: str, source_file: str, page_num: 
 		return []
 
 	endpoint, api_key, deployment, api_version = config
+	system_context_hint = (
+		"You are extracting commission invoice mappings from OCR text. "
+		"Your job is to map fields exactly, not to summarize. "
+		"Return JSON only with top-level key receipts. "
+		"If a page has no actual receipt, return {\"receipts\": []}. "
+		"Never invent missing values. Never copy HSN/SAC codes into GST fields. "
+		"Prefer leaving a field blank over guessing. "
+	)
+	bajaj_finance_context = _is_bajaj_finance_context(f"{source_file} {page_text}")
 
 	system_prompt = (
-		"You extract BALIC receipt mappings from OCR text. "
-		"A single page can contain multiple receipts or no receipt. "
-		"Return strict JSON only: {\"receipts\": [ ... ]}. "
-		"Create one object per actual receipt only, and never invent receipts. "
-		"If page has no receipt, return {\"receipts\": []}. "
-		"For each receipt object, use keys exactly: "
-		"Agent Name, Agent PAN, Name of Service Receipient, BROKER GSTN, BALIC STATE, "
-		"Vendor Inv Date, Vendor Inv No, Total Inv Amt, CGST @ 9%, SGST @ 9%, IGST, GST TOTAL AMT, Narration."
+		f"{system_context_hint} "
+		"A single page can contain one receipt, multiple receipts, or no receipt. "
+		"Use keys exactly: Agent Name, Agent PAN, Name of Service Receipient, BALIC STATE, BALIC GSTN, BROKER GSTN STATE, BROKER GSTN, Vendor Inv Date, Vendor Inv No, Total Inv Amt, BROKERAGE Amount, CGST @ 9%, SGST @ 9%, UTGST, IGST, GST TOTAL AMT, Narration. "
+		"Field rules: "
+		"1) BALIC GSTN is the recipient/company GSTIN. If a GSTIN belongs to Bajaj Allianz/BALIC, place it in BALIC GSTN. "
+		"2) BROKER GSTN is the broker/agent GSTIN; never duplicate BALIC GSTN into BROKER GSTN unless the text explicitly says the same GSTIN is used for both roles. "
+		"3) Vendor Inv No must be the invoice identifier only, not GSTIN, PAN, HSN, SAC, dates, page numbers, totals, or references. "
+		"4) Vendor Inv Date must be a date. If no date is present, leave blank. "
+		"5) Total Inv Amt is the invoice total. BROKERAGE Amount is the taxable brokerage amount. GST TOTAL AMT is only the tax amount or tax total. "
+		"6) Use either IGST or CGST+SGST/UTGST, not both. If the page clearly shows interstate tax, keep IGST and blank the state tax fields. If it clearly shows state tax, keep CGST/SGST or UTGST and blank IGST. If tax mode is confusing, inspect which tax cells are non-zero and map them exactly: zero fields stay blank, non-zero fields stay populated, and GST TOTAL should match the non-zero tax mode. Do not mix modes. "
+		"7) Narration should be a short business label such as COMMISSION, and can be blank if truly absent. "
+		"8) If OCR text contains multiple receipts on one page, return one object per receipt. "
+		"9) Do not fabricate invoice numbers from file names unless the invoice number is explicitly visible in OCR. "
+		"10) If numbers disagree or the mapping is uncertain, leave the field blank rather than guessing."
 	)
+	if bajaj_finance_context:
+		system_prompt += (
+			" Bajaj Finance specific rule: return only the single summary row whose Particulars cell says Total. "
+			"Ignore intermediate line items and do not split each line item into a separate receipt. "
+			"If no Total row is visible, return an empty receipts array."
+		)
 	user_prompt = (
 		f"Source file: {source_file}\n"
 		f"Page: {page_num}\n"
-		"Extract receipts from this text:\n"
+		"Extract receipts from this text. Preserve only values that are explicitly supported by the OCR. "
+		"If a value is ambiguous, blank it. Use the same field names exactly. "
+		f"{('Structured GST context: ' + context_hint + chr(10)) if context_hint else ''}"
+		"Text:\n"
 		f"{page_text[:24000]}"
 	)
 
@@ -563,47 +1950,20 @@ def validate_and_correct_taxes(
 	taxable_amount: str, cgst: str, sgst: str, utgst: str, igst: str
 ) -> Tuple[str, str, str, str, str]:
 	"""
-	Sanity check and auto-correct implausible tax amounts.
+	Sanity check tax amounts without mutating extracted values.
 	Expected rates: CGST @ 9%, SGST @ 9%, IGST @ 18%.
-	Flags implausible values (tax > 30% of taxable or < 5% of taxable) and corrects them.
-	Returns corrected (cgst, sgst, utgst, igst) tuple.
+	Returns original values so downstream validation can flag suspicious rows.
 	"""
-	try:
-		taxable_num = float(taxable_amount.replace(",", "")) if taxable_amount else 0
-	except (ValueError, AttributeError):
-		return cgst, sgst, utgst, igst
-	
-	if taxable_num <= 0:
-		return cgst, sgst, utgst, igst
-	
-	def correct_tax(tax_str: str, expected_rate: float) -> str:
-		if not tax_str:
-			return ""
-		try:
-			tax_num = float(tax_str.replace(",", ""))
-		except (ValueError, AttributeError):
-			return ""
-		tax_ratio = (tax_num / taxable_num) * 100
-		if tax_ratio > 30 or tax_ratio < 5:
-			corrected = taxable_num * (expected_rate / 100)
-			return f"{corrected:.2f}"
-		return tax_str
-	
-	cgst_corrected = correct_tax(cgst, 9.0) if cgst else ""
-	sgst_corrected = correct_tax(sgst, 9.0) if sgst else ""
-	utgst_corrected = correct_tax(utgst, 9.0) if utgst else ""
-	igst_corrected = correct_tax(igst, 18.0) if igst else ""
-	
-	return cgst_corrected, sgst_corrected, utgst_corrected, igst_corrected
+	return cgst, sgst, utgst, igst
 
 
 
 INDIAN_STATES = [
 	"Andhra Pradesh",
-	"Arunachal Pradesh",
+	"ARUNACHAL PRADESH",
 	"Assam",
 	"Bihar",
-	"Chhattisgarh",
+	"Chattisgarh",
 	"Goa",
 	"Gujarat",
 	"Haryana",
@@ -626,15 +1986,16 @@ INDIAN_STATES = [
 	"Tripura",
 	"Uttar Pradesh",
 	"Uttarakhand",
-	"West Bengal",
-	"Andaman and Nicobar Islands",
+	"Bengal",
+	"Andaman and Nicobar",
 	"Chandigarh",
-	"Dadra and Nagar Haveli and Daman and Diu",
+	"DAMAN AND DIU",
+	"DADRA AND NAGAR HAVELI",
 	"Delhi",
-	"Jammu and Kashmir",
+	"Jammu And Kashmir",
 	"Ladakh",
 	"Lakshadweep",
-	"Puducherry",
+	"PUDUCHERRY",
 ]
 
 
@@ -644,6 +2005,9 @@ def normalize_state_name(raw_state: str) -> str:
 	candidate = re.sub(r"\s+", " ", raw_state).strip()
 	if not candidate:
 		return ""
+	alias_candidate = STATE_NAME_ALIASES.get(candidate.lower(), "")
+	if alias_candidate:
+		return alias_candidate
 
 	for state in INDIAN_STATES:
 		if candidate.lower() == state.lower():
@@ -665,15 +2029,31 @@ def normalize_state_name(raw_state: str) -> str:
 	return ""
 
 
+def gstin_to_pan(value: str) -> str:
+	candidate = (value or "").strip().upper()
+	if not is_valid_gstin(candidate):
+		return ""
+	return candidate[2:12]
+
+
 def normalize_balic_company_name(raw_name: str) -> str:
 	if not raw_name:
 		return ""
 	name = re.sub(r"\s+", " ", raw_name).strip()
 	name_low = name.lower()
+	if name_low in {"namebaddress", "name/address", "name and address", "name & address"}:
+		return ""
 	if name_low in {"insurance limited", "insurance company ltd", "insurance company limited"}:
 		return ""
 	if "bajaj life insurance limited" in name_low and "allianz" not in name_low:
 		return "Bajaj Life Insurance Limited"
+	if (
+		"leela chambers" in name_low
+		or "bala lte irsurance umited" in name_low
+		or "bala lte insurance" in name_low
+		or ("satara road" in name_low and "aranyeshwar" in name_low)
+	):
+		return "Bajaj Allianz Life Insurance Company Ltd"
 	letters_only = re.sub(r"[^a-z]", "", name_low)
 	canon_letters = re.sub(r"[^a-z]", "", "bajaj allianz life insurance company ltd")
 
@@ -697,11 +2077,26 @@ def normalize_balic_company_name(raw_name: str) -> str:
 	return name
 
 
+def is_known_balic_entity(name: str) -> bool:
+	normalized = normalize_balic_company_name(sanitize_party_name(name or ""))
+	return normalized in {
+		"Bajaj Allianz Life Insurance Company Ltd",
+		"Bajaj Life Insurance Limited",
+	}
+
+
 def normalize_corporate_agent_name(raw_name: str) -> str:
 	if not raw_name:
 		return ""
-	name = re.sub(r"\s+", " ", raw_name).strip(" ,.-")
+	name = _strip_trailing_context_noise(raw_name)
 	low = name.lower()
+	if "bajaj housing" in low:
+		return "Bajaj Housing Finance Limited"
+	if "bajaj auto finance" in low or "bajaj finance" in low:
+		return "Bajaj Finance Limited"
+	# explicit override: treat 'Bajaj Auto' mentions as Bajaj Housing
+	if 'bajaj auto' in low:
+		return 'Bajaj Housing Finance Limited'
 	if "finozone" in low:
 		return "Finozone Financial Services"
 	if "jammu" in low and "kashmir" in low and "bank" in low:
@@ -718,7 +2113,7 @@ def normalize_corporate_agent_name(raw_name: str) -> str:
 def sanitize_party_name(raw_name: str) -> str:
 	if not raw_name:
 		return ""
-	name = re.sub(r"\s+", " ", raw_name).strip(" ,:-")
+	name = _strip_trailing_context_noise(raw_name)
 	name = re.sub(r"^(?:of\s+)+", "", name, flags=re.IGNORECASE)
 	name = re.sub(r"^(?:billed\s*to|bill\s*to|ship\s*to|service\s*recipient)\s*[:\-]?\s*", "", name, flags=re.IGNORECASE)
 	low = name.lower()
@@ -763,17 +2158,43 @@ def extract_provider_receiver_names(text: str) -> Tuple[str, str]:
 
 	# Tax Invoice specific layout: provider/receiver values are often around C/o and Bajaj life insurance markers.
 	if "tax invoice" in flat_low and "details of service" in flat_low:
+		# For TAX invoices, look for explicit bank/institution names first
+		bank_patterns = [
+			r"(IDFC\s+(?:FIRST\s+)?BANK)",
+			r"(Axis\s+Bank(?:\s+Ltd)?)",
+			r"(HDFC\s+Bank(?:\s+Ltd)?)",
+			r"(ICICI\s+Bank(?:\s+Ltd)?)",
+			r"(SBI|State\s+Bank\s+of\s+India)",
+			r"(Kotak\s+Mahindra\s+Bank)",
+			r"(IndusInd\s+Bank)",
+			r"(City\s+Union\s+Bank)",
+			r"(Ujjivan\s+(?:Small\s+Finance\s+)?Bank)",
+			r"(Federal\s+Bank)",
+			r"(RBL\s+Bank)",
+			r"(BOB|Bank\s+of\s+Baroda)",
+			r"(Union\s+Bank)",
+			r"(Canara\s+Bank)",
+		]
+		for pattern in bank_patterns:
+			match = re.search(pattern, flat, re.IGNORECASE)
+			if match:
+				provider = sanitize_party_name(match.group(1))
+				if provider:
+					receiver = extract_bajaj_company_name(flat)
+					return provider, receiver
+		
+		# Fallback for TAX invoices: extract from standard patterns
 		tax_agent = find_first([
 			r"c/o\s*([A-Za-z][A-Za-z\s&.,()'/-]{4,80}?(?:Limited|Ltd|Bank(?:\s+Ltd)?))",
 			r"(?:service|goods)\s+provider\s*[:\-]?\s*([A-Za-z][A-Za-z\s&.,()'/-]{4,80}?(?:Limited|Ltd|Bank(?:\s+Ltd)?))",
 		], flat)
 		tax_receiver = find_first([
-			r"(Bajaj\s+(?:Allianz\s+)?Life\s+Insurance(?:\s+Company)?\s+(?:Limited|Ltd))",
-			r"(Bajaj\s+Housing\s+Finance\s+(?:Limited|Ltd))",
 			r"(?:service|goods)\s+receiver\s*[:\-]?\s*([A-Za-z][A-Za-z\s&.,()'/-]{4,80}?(?:Limited|Ltd|Bank(?:\s+Ltd)?))",
 		], flat)
 		provider = sanitize_party_name(tax_agent)
 		receiver = sanitize_party_name(tax_receiver)
+		if not receiver:
+			receiver = extract_bajaj_company_name(flat)
 
 	provider_patterns = [
 		r"details\s+of\s+supplier\s*[:\-]?\s*([A-Za-z&.,()'/-]{4,120})",
@@ -787,19 +2208,21 @@ def extract_provider_receiver_names(text: str) -> Tuple[str, str]:
 		r"details\s+of\s+service\s+recipient\s*[:\-]?\s*([A-Za-z&.,()'/-]{4,120})",
 	]
 
-	for pattern in provider_patterns:
-		match = re.search(pattern, flat, re.IGNORECASE)
-		if match:
-			provider = sanitize_party_name(match.group(1))
-			if provider:
-				break
+	if not provider:
+		for pattern in provider_patterns:
+			match = re.search(pattern, flat, re.IGNORECASE)
+			if match:
+				provider = sanitize_party_name(match.group(1))
+				if provider:
+					break
 
-	for pattern in receiver_patterns:
-		match = re.search(pattern, flat, re.IGNORECASE)
-		if match:
-			receiver = sanitize_party_name(match.group(1))
-			if receiver:
-				break
+	if not receiver:
+		for pattern in receiver_patterns:
+			match = re.search(pattern, flat, re.IGNORECASE)
+			if match:
+				receiver = sanitize_party_name(match.group(1))
+				if receiver:
+					break
 
 	if (not provider) or (not receiver):
 		candidates = extract_company_candidates(text)
@@ -866,9 +2289,13 @@ def extract_agent_from_folder_path(source_path: Path) -> str:
 			return "IDFC FIRST Bank"
 		if "india post" in part_low:
 			return "India Post Payments Bank Ltd"
+		if "bajaj housing" in part_low:
+			return "Bajaj Housing Finance Limited"
+		if "bajaj auto finance" in part_low or "bajaj finance" in part_low:
+			return "Bajaj Finance Limited"
 		if "karur vysya" in part_low:
 			return "Karur Vysya Bank Ltd"
-		if "bajaj housing" in part_low:
+		if "bajaj auto" in part_low:
 			return "Bajaj Housing Finance Limited"
 		if "finozone" in part_low:
 			return "Finozone Financial Services"
@@ -964,6 +2391,8 @@ def extract_agent_from_folder_path(source_path: Path) -> str:
 			return "Yella Insurance Broking Pvt Ltd"
 		if "zoom insurance" in part_low:
 			return "Zoom Insurance Brokers Pvt Ltd"
+		if "mahindra" in part_low:
+			return "Mahindra Insurance Brokers Pvt Ltd"
 	
 	return ""
 
@@ -972,7 +2401,24 @@ def infer_corporate_agent_from_context(source_path: Path, text: str) -> str:
 	context = f"{source_path} {text}"
 	low = context.lower()
 
-	# First priority: extract from folder path
+	# Prefer explicit agent mentions in text/context first (avoids blanket folder defaults like 'IMF').
+	patterns = [
+		r"corporate\s*agent\s*[:\-]?\s*([A-Za-z&.,()'/-]{4,100}?)(?:\s+(?:gstin|pan|state|invoice|service|address|$))",
+		r"agent\s*name\s*[:\-]?\s*([A-Za-z&.,()'/-]{4,100}?)(?:\s+(?:gstin|pan|state|invoice|service|address|$))",
+	]
+	for pattern in patterns:
+		match = re.search(pattern, context, re.IGNORECASE)
+		if match:
+			candidate = normalize_corporate_agent_name(match.group(1))
+			if candidate and not _is_placeholder_agent_name(candidate):
+				return candidate
+
+	# Next prefer explicit provider extracted from document text
+	provider_name, receiver_name = extract_provider_receiver_names(text)
+	if provider_name and not _is_placeholder_agent_name(provider_name):
+		return provider_name
+
+	# Folder path fallback as last resort (previously caused IMF defaulting)
 	folder_agent = extract_agent_from_folder_path(source_path)
 	if folder_agent:
 		return folder_agent
@@ -1002,10 +2448,36 @@ def infer_corporate_agent_from_context(source_path: Path, text: str) -> str:
 		if not match:
 			continue
 		candidate = normalize_corporate_agent_name(match.group(1))
-		if candidate:
+		if candidate and not _is_placeholder_agent_name(candidate):
 			return candidate
 
 	return ""
+
+
+def _is_placeholder_agent_name(name: str) -> bool:
+	"""Check if agent name is a placeholder or corrupted value that should be skipped."""
+	if not name:
+		return True
+	low = name.lower().strip()
+	# Filter out obvious placeholders and corruption artifacts
+	skip_patterns = [
+		r"^/?provider$",  # /Provider or Provider alone
+		r"^/?receiver$",  # /Receiver or Receiver alone
+		r"^/?supplier$",  # /Supplier or Supplier alone
+		r"^/?agent$",  # /Agent or Agent alone
+		r"^/?corporate",  # /Corporate or Corporate alone
+		r"^/?service",  # /Service or Service alone
+		r"^/$",  # Just a slash
+		r"^[/\-\s]+$",  # Only slashes, dashes, spaces
+		r"^\d+$",  # Only numbers
+	]
+	for pattern in skip_patterns:
+		if re.match(pattern, low):
+			return True
+	# If name starts with "/" or is very short, likely corrupted
+	if name.startswith("/") or len(low) < 3:
+		return True
+	return False
 
 
 def extract_nkgsb_amount_row(text: str) -> Tuple[str, str, str, str, str]:
@@ -1352,6 +2824,65 @@ def extract_city_union_amounts(text: str) -> Tuple[str, str, str, str, str]:
 	return taxable, cgst, sgst, igst, total
 
 
+def extract_probitas_amounts(text: str) -> Tuple[str, str, str, str, str]:
+	"""Extract taxable/cgst/sgst/igst/total from Probitas invoice layouts."""
+	processed = re.sub(r"\s+", " ", text)
+	low = processed.lower()
+	if "probitas insurance brokers" not in low:
+		return "", "", "", "", ""
+
+	taxable = clean_amount(find_first([
+		r"hsn/sac\s+taxable\s*value\s+[0-9,.\s%]{6,80}?([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+		r"taxable\s*value\s*[:|]?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+	], processed))
+	cgst = ""
+	sgst = ""
+	igst = ""
+	total = clean_amount(find_first([
+		r"amount\s*chargeable\s*\(in\s*words\).*?total\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+		r"\btotal\b\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+	], processed))
+
+	# Common state-tax row: <tax_total> <cgst> 9% <sgst> 9% <taxable>
+	m_state = re.search(
+		r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*9\s*%\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*9\s*%\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+		processed,
+		re.IGNORECASE,
+	)
+	if m_state:
+		cgst = clean_amount(m_state.group(2))
+		sgst = clean_amount(m_state.group(3))
+		taxable = taxable or clean_amount(m_state.group(4))
+
+	# IGST variant: <tax_total> 18% <igst> <taxable>
+	m_igst = re.search(
+		r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*18\s*%\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
+		processed,
+		re.IGNORECASE,
+	)
+	if m_igst and not (cgst and sgst):
+		igst = clean_amount(m_igst.group(2))
+		taxable = taxable or clean_amount(m_igst.group(3))
+
+	try:
+		taxable_num = float((taxable or "").replace(",", "")) if taxable else 0.0
+		cgst_num = float((cgst or "").replace(",", "")) if cgst else 0.0
+		sgst_num = float((sgst or "").replace(",", "")) if sgst else 0.0
+		igst_num = float((igst or "").replace(",", "")) if igst else 0.0
+		if taxable_num <= 0 and cgst_num > 0 and sgst_num > 0:
+			if abs(cgst_num - sgst_num) <= max(2.0, max(cgst_num, sgst_num) * 0.05):
+				taxable_num = (cgst_num + sgst_num) / 0.18
+				taxable = f"{taxable_num:.2f}"
+		gst_num = igst_num if igst_num > 0 else (cgst_num + sgst_num)
+		total_num = float((total or "").replace(",", "")) if total else 0.0
+		if taxable_num > 0 and gst_num > 0 and (total_num <= taxable_num or abs(total_num - (taxable_num + gst_num)) > max(2.0, (taxable_num + gst_num) * 0.05)):
+			total = f"{(taxable_num + gst_num):.2f}"
+	except (ValueError, TypeError):
+		pass
+
+	return taxable, cgst, sgst, igst, total
+
+
 def extract_ethika_amounts(text: str) -> Tuple[str, str, str, str, str]:
 	"""Extract taxable/cgst/sgst/igst/total from Ethika invoice layouts."""
 	processed = re.sub(r"\s+", " ", text)
@@ -1647,133 +3178,269 @@ def apply_party_overrides(row: Dict[str, str], source_path: Path, context_text: 
 	if provider_name:
 		agent_name = provider_name
 	if receiver_name:
-		service_recipient = receiver_name
+		service_recipient = normalize_balic_service_recipient_name(receiver_name, context_text)
 
 	inferred_agent = infer_corporate_agent_from_context(source_path, context_text)
-	if inferred_agent:
+	if inferred_agent and (not agent_name or _is_placeholder_agent_name(agent_name) or agent_name.strip().lower() == "imf"):
 		agent_name = inferred_agent
 	else:
 		agent_name = normalize_corporate_agent_name(sanitize_party_name(agent_name))
+	if agent_name and agent_name.strip().lower() == "bajaj auto":
+		agent_name = "Bajaj Housing Finance Limited"
+
+	# Hard role rule: BALIC entities must be service recipients, never agents.
+	if is_known_balic_entity(agent_name):
+		if not service_recipient:
+			service_recipient = agent_name
+		agent_name = ""
 
 	row["Agent Name"] = agent_name
-
-	service_recipient = sanitize_party_name(service_recipient)
-	service_recipient = normalize_balic_company_name(service_recipient)
-	if service_recipient in {"", "Of Delivery", "Of"}:
-		service_recipient = ""
-
-	bank_source = any(token in source_low for token in ["jammu and kashmir bank", "nkgsb", "invoices axis", "july_25 dbs"])
-	tax_invoice_source = "tax invoice for date" in source_low
-	combined_text = f"{context_text} {service_recipient}"
-	has_balic_signal = bool(re.search(r"bajaj|allianz|alianz|amlanz|life\s*insurance", combined_text, re.IGNORECASE))
-	if has_balic_signal:
-		service_recipient = "Bajaj Allianz Life Insurance Company Ltd"
-
-	if bank_source and (not service_recipient or has_balic_signal):
-		row["Name of Service Receipient"] = "Bajaj Allianz Life Insurance Company Ltd"
-	elif tax_invoice_source:
-		tax_agent = sanitize_party_name(find_first([
-			r"c/o\s*([A-Za-z][A-Za-z\s&.,()'/-]{4,80}?(?:Limited|Ltd|Bank(?:\s+Ltd)?))",
-		], context_text))
-		tax_receiver = sanitize_party_name(find_first([
-			r"(Bajaj\s+(?:Allianz\s+)?Life\s+Insurance(?:\s+Company)?\s+(?:Limited|Ltd))",
-			r"(Bajaj\s+Housing\s+Finance\s+(?:Limited|Ltd))",
-		], context_text))
-		if tax_agent:
-			row["Agent Name"] = normalize_corporate_agent_name(tax_agent)
-		if tax_receiver:
-			row["Name of Service Receipient"] = normalize_balic_company_name(tax_receiver)
-		elif service_recipient:
-			row["Name of Service Receipient"] = normalize_balic_company_name(service_recipient)
-	elif service_recipient:
-		row["Name of Service Receipient"] = service_recipient
-	elif re.search(r"bajaj\s+allianz\s+life\s+insurance", context_text, re.IGNORECASE):
-		row["Name of Service Receipient"] = "Bajaj Allianz Life Insurance Company Ltd"
-	elif re.search(r"bajaj\s+life\s+insurance\s+limited", context_text, re.IGNORECASE):
-		row["Name of Service Receipient"] = "Bajaj Life Insurance Limited"
+	row["Name of Service Receipient"] = normalize_balic_service_recipient_name(service_recipient, context_text)
 
 	return row
 
 
 def normalize_mapping_anomalies(row: Dict[str, str], context_text: str = "", source_path: Optional[Path] = None) -> Dict[str, str]:
 	"""Fix known post-extraction mapping anomalies at row level."""
-	try:
-		source_low = str(source_path).lower() if source_path else ""
-		ctx = context_text or ""
-		ctx_low = ctx.lower()
-		# Enforce Medwell mapping from explicit tuple in text after all merge stages.
-		if "medwell insurance broking" in source_low or "medwell insurance broking" in ctx_low:
-			for m in re.finditer(
-				r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+18\s*%?\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
-				ctx,
-				re.IGNORECASE,
-			):
-				taxable_s = clean_amount(m.group(1))
-				igst_s = clean_amount(m.group(2))
-				total_s = clean_amount(m.group(3))
-				taxable_v = float(taxable_s or "0")
-				igst_v = float(igst_s or "0")
-				total_v = float(total_s or "0")
-				if taxable_v > 0 and igst_v > 0 and total_v >= taxable_v and total_v > igst_v:
-					row["BROKERAGE Amount"] = taxable_s
-					row["IGST"] = igst_s
-					row["GST TOTAL AMT"] = igst_s
-					row["Total Inv Amt"] = total_s
-					row["CGST @ 9%"] = ""
-					row["SGST @ 9%"] = ""
-					row["UTGST"] = ""
+	# Enforce strict GSTIN validity for final output fields.
+	for gstin_col in ["BALIC GSTN", "BROKER GSTN"]:
+		gstin_val = (row.get(gstin_col, "") or "").strip().upper()
+		if gstin_val and not is_valid_gstin(gstin_val):
+			row[gstin_col] = ""
+		elif gstin_val:
+			row[gstin_col] = gstin_val
+
+	if not (row.get("BALIC STATE", "") or "").strip() and (row.get("BALIC GSTN", "") or "").strip():
+		row["BALIC STATE"] = gstin_to_state_name(row.get("BALIC GSTN", ""))
+
+	if not (row.get("BROKER GSTN STATE", "") or "").strip() and (row.get("BROKER GSTN", "") or "").strip():
+		row["BROKER GSTN STATE"] = gstin_to_state_name(row.get("BROKER GSTN", ""))
+
+	row = apply_company_wise_issue_mapping(row, source_path, context_text)
+
+	# Generic fallback: use source name/text to recover a missing or placeholder agent.
+	if ((not (row.get("Agent Name", "") or "").strip()) or _is_placeholder_agent_name(row.get("Agent Name", ""))) and source_path:
+		source_agent = infer_corporate_agent_from_context(source_path, context_text)
+		if source_agent:
+			row["Agent Name"] = source_agent
+
+	if (row.get("Agent Name", "") or "").strip().lower() == "bajaj auto":
+		row["Agent Name"] = "Bajaj Housing Finance Limited"
+
+	if AGENT_CODE_BY_NAME and not (row.get("AGENT_CODE", "") or "").strip():
+		candidate_names = [
+			row.get("Agent Name", ""),
+			str(source_path or ""),
+			Path(source_path).name if source_path else "",
+		]
+		for candidate_name in candidate_names:
+			candidate_name = (candidate_name or "").strip()
+			if not candidate_name:
+				continue
+			matched_code, clean_name, similarity = find_best_matching_agent_code(candidate_name)
+			if matched_code:
+				row["AGENT_CODE"] = matched_code
+				if clean_name:
+					row["Agent Name"] = clean_name
+				break
+
+	balic_gstn = (row.get("BALIC GSTN", "") or "").strip().upper()
+	broker_gstn = (row.get("BROKER GSTN", "") or "").strip().upper()
+	agent_pan = (row.get("Agent PAN", "") or "").strip().upper()
+	recipient_low = (row.get("Name of Service Receipient", "") or "").strip().lower()
+	source_low = str(source_path).lower() if source_path else ""
+	ctx_low = (context_text or "").lower()
+
+	if (
+		balic_gstn
+		and re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", agent_pan)
+		and agent_pan in balic_gstn
+		and ("bajaj" in recipient_low or "allianz" in recipient_low or "life" in recipient_low)
+	):
+		candidates = extract_gstin_candidates(context_text or "")
+		for candidate in candidates:
+			cand = (candidate or "").strip().upper()
+			if is_valid_gstin(cand) and cand != balic_gstn and agent_pan not in cand:
+				row["BALIC GSTN"] = cand if "AADCA1701E" in cand else row["BALIC GSTN"]
+				break
+
+	if balic_gstn:
+		row["BALIC STATE"] = gstin_to_state_name(balic_gstn)
+	if broker_gstn:
+		row["BROKER GSTN STATE"] = gstin_to_state_name(broker_gstn)
+
+	if balic_gstn and broker_gstn and balic_gstn == broker_gstn:
+		candidates = extract_gstin_candidates(context_text or "")
+		replacement = ""
+		for candidate in candidates:
+			cand = (candidate or "").strip().upper()
+			if not is_valid_gstin(cand) or cand == balic_gstn:
+				continue
+			if re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", agent_pan) and agent_pan in cand:
+				replacement = cand
+				break
+		if not replacement:
+			for candidate in candidates:
+				cand = (candidate or "").strip().upper()
+				if is_valid_gstin(cand) and cand != balic_gstn and "AADCA1701E" not in cand:
+					replacement = cand
+					break
+		if replacement:
+			row["BROKER GSTN"] = replacement
+			row["BROKER GSTN STATE"] = gstin_to_state_name(replacement)
+
+	row["Name of Service Receipient"] = normalize_balic_service_recipient_name(row.get("Name of Service Receipient", ""), context_text)
+
+	if not (row.get("BALIC STATE", "") or "").strip() and source_path:
+		for state in sorted(INDIAN_STATES, key=len, reverse=True):
+			if re.search(rf"\b{re.escape(state)}\b", str(source_path), re.IGNORECASE):
+				row["BALIC STATE"] = state
+				break
+
+	vendor_date = (row.get("Vendor Inv Date", "") or "").strip()
+	if not vendor_date or not re.fullmatch(r"\d{2}/\d{2}/20(?:25|26)", vendor_date):
+		inferred_date = infer_plausible_date_from_text(f"{source_path} {context_text}")
+		if inferred_date:
+			row["Vendor Inv Date"] = inferred_date
+
+	# Dhanlaxmi fallback: if broker GSTIN is missing, recover any valid non-BALIC GSTIN from context.
+	if "dhanlaxmi" in source_low or "dhanlaxmi" in ctx_low:
+		if not (row.get("BROKER GSTN", "") or "").strip():
+			for candidate in extract_gstin_candidates(context_text or ""):
+				cand = candidate.strip().upper()
+				if is_valid_gstin(cand) and "AADCA1701E" not in cand:
+					row["BROKER GSTN"] = cand
+					row["BROKER GSTN STATE"] = gstin_to_state_name(cand)
 					break
 
-		total_num = float((row.get("Total Inv Amt") or "").replace(",", "")) if row.get("Total Inv Amt") else 0
-		cg_num = float((row.get("CGST @ 9%") or "").replace(",", "")) if row.get("CGST @ 9%") else 0
-		sg_num = float((row.get("SGST @ 9%") or "").replace(",", "")) if row.get("SGST @ 9%") else 0
-		ut_num = float((row.get("UTGST") or "").replace(",", "")) if row.get("UTGST") else 0
-		ig_num = float((row.get("IGST") or "").replace(",", "")) if row.get("IGST") else 0
-		gst_num = float((row.get("GST TOTAL AMT") or "").replace(",", "")) if row.get("GST TOTAL AMT") else 0
+	# For City Union and Bajaj receipts: infer state from path/text (Tamil Nadu vs Telangana)
+	if any(k in source_low for k in ("city union", "bajaj")) or any(k in ctx_low for k in ("city union", "bajaj")):
+		inferred_state = ""
+		# Prefer explicit Tamil Nadu indicators first
+		if any(tok in source_low for tok in ("tamil nadu", "tamilnadu", "tamil", " tn ")) or any(tok in ctx_low for tok in ("tamil nadu", "tamilnadu", "tamil", " tn ")):
+			inferred_state = "Tamil Nadu"
+		# Check Telangana indicators (including common misspelling)
+		elif any(tok in source_low for tok in ("telangana", "telengana", "hyderabad", "hyd")) or any(tok in ctx_low for tok in ("telangana", "telengana", "hyderabad", "hyd")):
+			inferred_state = "Telangana"
 
-		# Collapse duplicate CGST/SGST/IGST value into IGST-only mapping.
-		if cg_num > 0 and sg_num > 0 and ig_num > 0:
-			same_state = abs(cg_num - sg_num) <= max(cg_num, sg_num) * 0.05
-			same_all = abs(cg_num - ig_num) <= max(cg_num, ig_num) * 0.05
-			if same_state and same_all:
-				row["CGST @ 9%"] = ""
-				row["SGST @ 9%"] = ""
-				row["UTGST"] = ""
-				row["GST TOTAL AMT"] = f"{ig_num:.2f}"
+		# If we inferred a state, prefer GSTIN candidates whose state matches it.
+		if inferred_state:
+			row_state_before = (row.get("BALIC STATE", "") or "").strip()
+			if not row_state_before:
+				row["BALIC STATE"] = inferred_state
 
-		# Re-map IGST to CGST+SGST when the row clearly behaves like a state-tax invoice.
-		# This fixes cases where OCR mapped one state-tax component into IGST.
-		has_state_tax_labels = bool(re.search(r"\b(cgst|sgst|utgst)\b", ctx_low))
-		has_igst_label = bool(re.search(r"\b(igst|integrated\s+tax)\b", ctx_low))
-		if ig_num > 0 and cg_num == 0 and sg_num == 0 and ut_num == 0:
-			brok_num = float((row.get("BROKERAGE Amount") or "").replace(",", "")) if row.get("BROKERAGE Amount") else 0
-			inferred_gst = (total_num - brok_num) if (total_num > 0 and brok_num > 0) else 0
-			tol = max(2.0, ig_num * 0.05)
+			if not (row.get("BALIC GSTN", "") or "").strip():
+				for candidate in extract_gstin_candidates(context_text or ""):
+					cand = candidate.strip().upper()
+					if not is_valid_gstin(cand):
+						continue
+					cand_state = gstin_to_state_name(cand)
+					if cand_state and cand_state == inferred_state:
+						# prefer BALIC matching PAN fragment if present
+						if "AADCA1701E" in cand or not (row.get("BALIC GSTN", "") or "").strip():
+							row["BALIC GSTN"] = cand
+							row["BALIC STATE"] = cand_state
+							break
 
-			looks_like_split_tax = False
-			if inferred_gst > 0 and abs(inferred_gst - (2.0 * ig_num)) <= tol:
-				looks_like_split_tax = True
-			elif gst_num > 0 and abs(gst_num - (2.0 * ig_num)) <= tol:
-				looks_like_split_tax = True
+			if not (row.get("BROKER GSTN", "") or "").strip():
+				for candidate in extract_gstin_candidates(context_text or ""):
+					cand = candidate.strip().upper()
+					if not is_valid_gstin(cand):
+						continue
+					cand_state = gstin_to_state_name(cand)
+					if cand_state and cand_state == inferred_state and "AADCA1701E" not in cand:
+						row["BROKER GSTN"] = cand
+						row["BROKER GSTN STATE"] = cand_state
+						break
 
-			if looks_like_split_tax and (has_state_tax_labels or (not has_igst_label) or inferred_gst > 0):
-				row["CGST @ 9%"] = f"{ig_num:.2f}"
-				row["SGST @ 9%"] = f"{ig_num:.2f}"
-				row["UTGST"] = ""
-				row["IGST"] = ""
-				if inferred_gst > 0:
-					row["GST TOTAL AMT"] = f"{inferred_gst:.2f}"
-				else:
-					row["GST TOTAL AMT"] = f"{(2.0 * ig_num):.2f}"
+	# City Union and other state-tax rows: if GST TOTAL matches IGST and state tax is also present, prefer IGST-only.
+	try:
+		gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+		igst_v = _amount_to_float(row.get("IGST", ""))
+		cgst_v = _amount_to_float(row.get("CGST @ 9%", ""))
+		sgst_v = _amount_to_float(row.get("SGST @ 9%", ""))
+		utgst_v = _amount_to_float(row.get("UTGST", ""))
+		# If GST TOTAL equals IGST within tolerance, but state components are present, prefer IGST-only.
+		if gst_total > 0 and igst_v > 0 and abs(gst_total - igst_v) <= max(2.0, igst_v * 0.02) and (cgst_v > 0 or sgst_v > 0 or utgst_v > 0):
+			row["CGST @ 9%"] = ""
+			row["SGST @ 9%"] = ""
+			row["UTGST"] = ""
+			row["IGST"] = f"{igst_v:.2f}"
+			row["GST TOTAL AMT"] = f"{igst_v:.2f}"
 
-		# If total is actually a tax component, clear it instead of deriving a new value.
-		tax_component = max(cg_num, sg_num, ut_num, ig_num)
-		if gst_num > 0 and total_num > 0:
-			if abs(total_num - tax_component) <= max(1.0, tax_component * 0.05) or total_num <= tax_component * 1.05:
-				row["Total Inv Amt"] = ""
-	except (ValueError, AttributeError, ZeroDivisionError):
+		# If GST TOTAL is approximately double the IGST, the invoice likely represents split state tax (CGST+SGST).
+		# In that case map IGST -> CGST/SGST halves and clear IGST.
+		if gst_total > 0 and igst_v > 0 and abs(gst_total - (2.0 * igst_v)) <= max(2.0, igst_v * 0.02) and cgst_v == 0 and sgst_v == 0 and utgst_v == 0:
+			half = igst_v
+			row["CGST @ 9%"] = f"{half:.2f}"
+			row["SGST @ 9%"] = f"{half:.2f}"
+			row["UTGST"] = ""
+			row["IGST"] = ""
+			row["GST TOTAL AMT"] = f"{gst_total:.2f}"
+	except (ValueError, TypeError):
 		pass
+
+	# Clean invoice number text.
+	inv = (row.get("Vendor Inv No", "") or "").strip()
+	if inv:
+		row["Vendor Inv No"] = clean_invoice_no(inv)
+
+	if "GROUPNONMICRO" in (row.get("Narration", "") or ""):
+		row["Narration"] = (row.get("Narration", "") or "").replace("GROUPNONMICRO", "").strip()
+
+	# Ujjivan: set agent name and code if missing
+	if "ujjivan" in source_low or "ujjivan" in ctx_low:
+		if not (row.get("Agent Name", "") or "").strip():
+			row["Agent Name"] = "Ujjivan"
+		# Attempt direct extraction of agent code from context (e.g., 'Agent Code: ABC123').
+		if not (row.get("AGENT_CODE", "") or "").strip():
+			m = re.search(r"agent\s*code\s*[:\-]?\s*([A-Z0-9-]{3,20})", context_text or "", re.IGNORECASE)
+			if not m:
+				m = re.search(r"agent\s*code\s*[:\-]?\s*([A-Z0-9-]{3,20})", str(source_path) or "", re.IGNORECASE)
+			if m:
+				row["AGENT_CODE"] = m.group(1).upper()
+			else:
+				if AGENT_CODE_BY_NAME:
+					matched, clean_name, sim = find_best_matching_agent_code(row.get("Agent Name", ""))
+					if matched:
+						row["AGENT_CODE"] = matched
+						row["Agent Name"] = clean_name
+				# fallback: try fuzzy match using source path segments
+				if not (row.get("AGENT_CODE", "") or "").strip() and AGENT_CODE_BY_NAME:
+					parts = re.split(r"[\\/\-_ ]+", str(source_path) or "")
+					for p in parts:
+						if not p:
+							continue
+						matched, clean_name, sim = find_best_matching_agent_code(p)
+						if matched:
+							row["AGENT_CODE"] = matched
+							row["Agent Name"] = clean_name
+							break
+				if not (row.get("AGENT_CODE", "") or "").strip() and AGENT_CODE_BY_NAME:
+					for agent_name_key, agent_code in AGENT_CODE_BY_NAME.items():
+						if "ujjivan" in agent_name_key:
+							row["AGENT_CODE"] = agent_code
+							row["Agent Name"] = AGENT_NAME_BY_CODE.get(agent_code, "Ujjivan")
+							break
+
+	# IMF: set agent name if missing (IMF files don't have embedded company names usually)
+	if "imf" in source_low or "imf" in ctx_low:
+		if not (row.get("Agent Name", "") or "").strip():
+			row["Agent Name"] = "IMF"
+
+	# Bajaj Housing detection: look for common variants in text or filename and set Agent Name.
+	if any(k in source_low for k in ("bajaj housing", "bajaj housing finance", "bajaj housing finance limited")) or any(k in ctx_low for k in ("bajaj housing", "bajaj housing finance", "bajaj housing finance limited")):
+		if not (row.get("Agent Name", "") or "").strip():
+			row["Agent Name"] = "Bajaj Housing Finance Limited"
+		# attempt to set agent code via mapping or context
+		if not (row.get("AGENT_CODE", "") or "").strip():
+			if AGENT_CODE_BY_NAME:
+				matched, clean_name, sim = find_best_matching_agent_code(row.get("Agent Name", ""))
+				if matched:
+					row["AGENT_CODE"] = matched
+
 	return row
+
 
 
 def extract_state_from_text(flattened: str) -> str:
@@ -1812,17 +3479,42 @@ def extract_company_from_address_start(flattened: str) -> str:
 
 
 def is_valid_invoice_no(value: str) -> bool:
-	candidate = (value or "").strip()
+	candidate = clean_invoice_no(value)
 	if len(candidate) < 4:
 		return False
 	if not re.search(r"\d", candidate):
 		return False
 	if candidate.lower() in {"date", "particulars", "invoice", "inv"}:
 		return False
+	if re.search(r"(?i)\b(?:invoice|dated?|date|dt)\b", candidate):
+		return False
+	if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", candidate):
+		return False
 	candidate_compact = re.sub(r"\s+", "", candidate.upper())
+	if re.fullmatch(r"\d{64}", candidate_compact):
+		return False
 	if re.fullmatch(r"\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]", candidate_compact):
 		return False
 	return True
+
+
+def clean_invoice_no(value: str) -> str:
+	"""Normalize invoice identifier: remove words like 'invoice', 'inv', 'dated', surrounding noise."""
+	if not value:
+		return ""
+	s = str(value).strip()
+	# Remove common leading/trailing labels and words
+	s = re.sub(r"(?i)^(?:invoice\s*(?:no\.?|number)?\s*[:\-\s]*|dated?\s*[:\-\s]*|date\s*[:\-\s]*|dt\s*[:\-\s]*)", "", s)
+	s = re.sub(r"(?i)\b(?:invoice|dated?|date|dt)\b[:\s-]*", "", s)
+	# Remove enclosing words like 'Invoice No: 123' and keep the core token
+	s = re.sub(r"[\s\-:,]+$", "", s)
+	s = re.sub(r"^[:\-\s,]+", "", s)
+	s = s.strip()
+	# Avoid returning long 64-digit IRN-like numbers
+	compact = re.sub(r"\s+", "", s)
+	if re.fullmatch(r"\d{64}", compact):
+		return ""
+	return s
 
 
 def find_first(patterns: Sequence[str], text: str, flags: int = re.IGNORECASE) -> str:
@@ -1900,7 +3592,7 @@ def words_to_number(words: str) -> str:
 	        "eighteen": 18, "nineteen": 19}
 	tens = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
 	       "eighty": 80, "ninety": 90}
-	scales = {"hundred": 100, "thousand": 1000, "lakh": 100000, "crore": 10000000}
+	scales = {"thousand": 1000, "lakh": 100000, "crore": 10000000}
 	
 	# Extract decimal part (paise) if present
 	decimal_part = ""
@@ -1950,31 +3642,31 @@ def words_to_number(words: str) -> str:
 					decimal_part = f".{paise_value:02d}"
 				words = words[:paise_match.start()]
 	
-	# Try to parse the main number
-	current = 0
+	# Parse the main number with Indian grouping semantics.
 	result = 0
-	
+	current_group = 0
+
 	for word in words.split():
 		if word in ones:
-			current += ones[word]
+			current_group += ones[word]
 		elif word in tens:
-			current += tens[word]
+			current_group += tens[word]
+		elif word == "hundred":
+			if current_group == 0:
+				current_group = 1
+			current_group *= 100
 		elif word in scales:
 			scale = scales[word]
-			current *= scale
-			if scale == 100:  # hundred
-				result += current
-				current = 0
-			else:  # thousand, lakh, crore
-				result += current
-				current = 0
+			if current_group == 0:
+				continue
+			result += current_group * scale
+			current_group = 0
 		elif word not in ["and", "only", "rupees"]:
-			# Try to extract numbers if not a recognized word
 			num_match = re.search(r"\d+", word)
 			if num_match:
-				current += int(num_match.group())
-	
-	result += current
+				current_group += int(num_match.group())
+
+	result += current_group
 	
 	if result == 0 and not decimal_part:
 		return ""
@@ -1998,7 +3690,7 @@ def extract_tax_amount(text: str, tax_name: str) -> str:
 	match = re.search(pattern, processed, re.IGNORECASE | re.DOTALL)
 	if match:
 		candidate = clean_amount(match.group(2))
-		if candidate and float(candidate) > 10:
+		if candidate and float(candidate) > 30:
 			return candidate
 
 	# 2) Segment scan: find % AMOUNT pairs near tax name
@@ -2009,14 +3701,14 @@ def extract_tax_amount(text: str, tax_name: str) -> str:
 		pairs = re.findall(r"\d{1,2}(?:\.\d+)?\s*%[^0-9]{0,12}([0-9][0-9,]*(?:\.[0-9]{1,2})?)", search_text, re.IGNORECASE)
 		for amount in pairs:
 			candidate = clean_amount(amount)
-			if candidate and float(candidate) > 10:
+			if candidate and float(candidate) > 30:
 				return candidate
 
 	# 3) Explicit label fallback: CGST amount 123.45
 	label_match = re.search(rf"{tax_name}\s*(?:amount)?\s*[:\-]?\s*([0-9][0-9,]*(?:\.[0-9]{{1,2}})?)(?!\s*%)", processed, re.IGNORECASE)
 	if label_match:
 		candidate = clean_amount(label_match.group(1))
-		if candidate and float(candidate) > 10:
+		if candidate and float(candidate) > 30:
 			return candidate
 	
 	return ""
@@ -2330,41 +4022,64 @@ def extract_motilal_igst_amounts(text: str) -> Tuple[str, str, str]:
 
 
 def try_parse_date(raw: str) -> str:
-	raw = raw.strip().replace(".", "/").replace("-", "/")
-	match = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", raw)
-	if not match:
+	raw = (raw or "").strip()
+	if not raw:
 		return ""
-	
-	date_str = match.group(1)
-	parts = date_str.split("/")
-	if len(parts) != 3:
+	candidate = raw.replace(".", "/").replace("-", "/")
+	match = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", candidate)
+	if match:
+		candidate = match.group(1)
+	else:
+		month_match = re.search(r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b", raw)
+		if month_match:
+			candidate = month_match.group(0)
+
+	parsed_candidates: List[pd.Timestamp] = []
+	for dayfirst in (True, False):
+		parsed = pd.to_datetime(candidate, dayfirst=dayfirst, errors="coerce")
+		if pd.notna(parsed):
+			parsed_candidates.append(parsed)
+	if not parsed_candidates:
 		return ""
-	
-	try:
-		# Try to parse as day/month/year or month/day/year
-		day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
-		
-		# Fix 2-digit years: 00-30 -> 2000-2030, 31-99 -> 1931-1999
-		if year < 100:
-			year = 2000 + year if year <= 30 else 1900 + year
-		
-		# Validate ranges
-		if not (1 <= month <= 12):
-			return ""
-		if not (1 <= day <= 31):
-			return ""
-		if not (1900 <= year <= 2100):
-			return ""
-		
-		# More strict validation: check if day is reasonable for the month
-		if month in [4, 6, 9, 11] and day > 30:
-			return ""
-		if month == 2 and day > 29:
-			return ""
-		
-		return date_str
-	except (ValueError, IndexError):
+	valid_candidates = [p for p in parsed_candidates if 2025 <= p.year <= 2026]
+	if not valid_candidates:
 		return ""
+	current_ts = pd.Timestamp.now().normalize()
+	parsed_candidates = valid_candidates
+	parsed_candidates.sort(key=lambda p: (p > current_ts, -p.value))
+	return parsed_candidates[0].strftime("%d/%m/%Y")
+
+
+def infer_plausible_date_from_text(text: str) -> str:
+	"""Extract a plausible invoice date from file/folder names or OCR text."""
+	raw = (text or "").strip()
+	if not raw:
+		return ""
+	patterns = [
+		r"(?<!\d)(\d{1,2})[._/-](\d{1,2})[._/-](2025|2026|\d{2,4})(?!\d)",
+		r"(?<!\d)(\d{2})(\d{2})(25|26)(?!\d)",
+		r"(?<!\d)(\d{2})(\d{2})(2025|2026)(?!\d)",
+		r"(?<!\d)(2025|2026)(\d{2})(\d{2})(?!\d)",
+	]
+	for pattern in patterns:
+		match = re.search(pattern, raw)
+		if not match:
+			continue
+		groups = match.groups()
+		candidate = ""
+		if len(groups) == 3 and groups[0].isdigit() and groups[1].isdigit():
+			first, second, third = groups
+			if len(third) == 2:
+				third = f"20{third}"
+			candidate = f"{first}/{second}/{third}"
+		elif len(groups) == 3 and groups[0] in {"2025", "2026"}:
+			year, month, day = groups
+			candidate = f"{day}/{month}/{year}"
+		if candidate:
+			parsed = try_parse_date(candidate)
+			if parsed:
+				return parsed
+	return ""
 
 
 def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
@@ -2389,6 +4104,23 @@ def score_ocr_text(text: str) -> int:
 	return len(re.findall(r"[A-Za-z0-9]", text))
 
 
+def score_receipt_ocr_text(text: str) -> int:
+	if not text:
+		return 0
+	base = score_ocr_text(text)
+	bonus = 0
+	if re.search(r"\b(invoice|tax\s+invoice|inv\s*no|vendor\s*inv|gstin|hsn|sac)\b", text, re.IGNORECASE):
+		bonus += 30
+	if re.search(r"\b(cgst|sgst|utgst|igst|taxable|total)\b", text, re.IGNORECASE):
+		bonus += 30
+	amount_hits = len(re.findall(r"\b[0-9][0-9,]{1,}(?:\.[0-9]{1,2})?\b", text))
+	bonus += min(50, amount_hits * 2)
+	return base + bonus
+
+
+MIN_OCR_ALNUM_SCORE = 50
+
+
 def get_rapidocr_engine():
 	global RAPIDOCR_ENGINE
 	global RAPIDOCR_INIT_FAILED
@@ -2404,6 +4136,50 @@ def get_rapidocr_engine():
 			RAPIDOCR_INIT_FAILED = True
 			return None
 	return RAPIDOCR_ENGINE
+
+
+def get_easyocr_reader():
+	global EASYOCR_READER
+	global EASYOCR_INIT_FAILED
+	if easyocr is None:
+		return None
+	if EASYOCR_INIT_FAILED:
+		return None
+	if EASYOCR_READER is None:
+		try:
+			EASYOCR_READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+		except Exception as exc:
+			LOGGER.warning("EasyOCR initialization failed: %s", exc)
+			EASYOCR_INIT_FAILED = True
+			return None
+	return EASYOCR_READER
+
+
+def ocr_image_with_easyocr(image: Image.Image) -> str:
+	reader = get_easyocr_reader()
+	if reader is None:
+		return ""
+	try:
+		arr = np.array(image)
+		result = reader.readtext(arr, detail=0, paragraph=True)
+		if not result:
+			return ""
+		return normalize_text("\n".join(str(x) for x in result if str(x).strip()))
+	except Exception as exc:
+		LOGGER.debug("EasyOCR failed for image: %s", exc)
+		return ""
+
+
+def ocr_image_with_tesseract(image: Image.Image) -> str:
+	if pytesseract is None:
+		return ""
+	try:
+		# OEM 1 + PSM 6 works well for dense invoice/table blocks.
+		txt = pytesseract.image_to_string(image, config="--oem 1 --psm 6")
+		return normalize_text(txt or "")
+	except Exception as exc:
+		LOGGER.debug("Tesseract failed for image: %s", exc)
+		return ""
 
 
 def ocr_image_single(image: Image.Image, prefer_google: bool = False, force_google: bool = False) -> str:
@@ -2448,8 +4224,30 @@ def ocr_image_single(image: Image.Image, prefer_google: bool = False, force_goog
 	if force_google and vision_text:
 		return vision_text
 
-	candidates = [rapid_text, vision_text]
-	best = max(candidates, key=score_ocr_text)
+	# Open-source ensemble fallback when primary OCR is weak or cloud OCR is unavailable.
+	open_source_candidates: List[str] = [rapid_text]
+	if score_receipt_ocr_text(rapid_text) < 90:
+		easy_text = ocr_image_with_easyocr(prepared)
+		if easy_text:
+			open_source_candidates.append(easy_text)
+		tess_text = ocr_image_with_tesseract(prepared)
+		if tess_text:
+			open_source_candidates.append(tess_text)
+		# Alternate thresholded variant can recover faint scans.
+		alt = image.convert("L")
+		alt = ImageEnhance.Contrast(alt).enhance(2.2)
+		alt = alt.filter(ImageFilter.SHARPEN)
+		alt = alt.point(lambda p: 255 if p > 145 else 0)
+		easy_alt = ocr_image_with_easyocr(alt)
+		if easy_alt:
+			open_source_candidates.append(easy_alt)
+		tess_alt = ocr_image_with_tesseract(alt)
+		if tess_alt:
+			open_source_candidates.append(tess_alt)
+
+	best_open_source = max(open_source_candidates, key=score_receipt_ocr_text) if open_source_candidates else ""
+	candidates = [best_open_source, vision_text]
+	best = max(candidates, key=score_receipt_ocr_text)
 	return best or ""
 
 
@@ -2473,7 +4271,7 @@ def ocr_image(image: Image.Image, prefer_google: bool = False, force_google: boo
 
 
 def ocr_image_with_google_vision(image: Image.Image) -> str:
-	global GOOGLE_VISION_CALL_COUNT
+	global GOOGLE_VISION_CALL_COUNT, GOOGLE_VISION_DISABLED_FOR_RUN, GOOGLE_VISION_API_KEY
 	api_key = get_google_vision_api_key()
 	if not api_key:
 		return ""
@@ -2510,9 +4308,78 @@ def ocr_image_with_google_vision(image: Image.Image) -> str:
 			if annotations:
 				full_text = annotations[0].get("description", "")
 		return normalize_text(full_text)
+	except urllib.error.HTTPError as exc:
+		body_text = ""
+		try:
+			body_text = exc.read().decode("utf-8", errors="replace")
+		except Exception:
+			body_text = ""
+		if exc.code == 403:
+			GOOGLE_VISION_DISABLED_FOR_RUN = True
+			LOGGER.warning("Google Vision OCR disabled for this run after HTTP 403: %s", body_text or exc)
+		else:
+			LOGGER.warning("Google Vision OCR failed with HTTP %s: %s", exc.code, body_text or exc)
+		return ""
 	except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
 		LOGGER.warning("Google Vision OCR failed: %s", exc)
 		return ""
+
+
+def probe_google_vision_api(image: Image.Image) -> Dict[str, str]:
+	"""Run the Google Vision request once and return a structured diagnostic payload.
+
+	This is useful for distinguishing API/auth problems from OCR parsing issues.
+	"""
+	api_key = get_google_vision_api_key()
+	result: Dict[str, str] = {"ok": "false", "status": "no_api_key", "text": "", "error": ""}
+	if not api_key:
+		result["error"] = "GOOGLE_VISION_API_KEY is not configured"
+		return result
+
+	try:
+		buffer = io.BytesIO()
+		image.save(buffer, format="PNG")
+		content = base64.b64encode(buffer.getvalue()).decode("ascii")
+		payload = {
+			"requests": [
+				{
+					"image": {"content": content},
+					"features": [{"type": "TEXT_DETECTION"}],
+				}
+			]
+		}
+		request = urllib.request.Request(
+			url=f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
+			data=json.dumps(payload).encode("utf-8"),
+			headers={"Content-Type": "application/json"},
+			method="POST",
+		)
+		with urllib.request.urlopen(request, timeout=30) as response:
+			body = response.read().decode("utf-8")
+		parsed = json.loads(body)
+		responses = parsed.get("responses", [])
+		first = responses[0] if responses else {}
+		full_text = first.get("fullTextAnnotation", {}).get("text", "") or ""
+		if not full_text:
+			annotations = first.get("textAnnotations", [])
+			if annotations:
+				full_text = annotations[0].get("description", "") or ""
+		result["ok"] = "true"
+		result["status"] = "200"
+		result["text"] = normalize_text(full_text)
+		return result
+	except urllib.error.HTTPError as exc:
+		try:
+			body_text = exc.read().decode("utf-8", errors="replace")
+		except Exception:
+			body_text = ""
+		result["status"] = str(exc.code)
+		result["error"] = body_text or str(exc)
+		return result
+	except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+		result["status"] = "error"
+		result["error"] = str(exc)
+		return result
 
 
 def infer_password_from_name(file_name: str) -> Optional[str]:
@@ -2713,15 +4580,110 @@ def extract_zip_to_temp(zip_path: Path) -> Path:
 	return temp_dir
 
 
+def _excel_engine_for_path(path: Path) -> Optional[str]:
+	suffix = path.suffix.lower()
+	if suffix == ".xlsb":
+		return "pyxlsb"
+	if suffix == ".xls":
+		return "xlrd"
+	return None
+
+
+def _is_meaningful_excel_value(value: object) -> bool:
+	if value is None or (isinstance(value, float) and pd.isna(value)):
+		return False
+	text = str(value).strip()
+	return bool(text and text.lower() != "nan")
+
+
+def _excel_row_to_fields(row: Dict[str, object], source_file: str, sheet_name: str, row_number: int) -> Optional[Dict[str, str]]:
+	row_text = " ".join(str(value).strip() for value in row.values() if _is_meaningful_excel_value(value))
+	if not row_text:
+		return None
+	fields = _ai_row_to_output_fields(row)
+	fields = apply_party_overrides(fields, Path(source_file), row_text)
+	fields = backfill_agent_pan(fields, row_text)
+	fields = normalize_mapping_anomalies(fields, row_text, Path(source_file))
+	fields = enforce_tax_mode_fields(fields)
+	fields = apply_gst_autofill(fields)
+	if not (fields.get("Narration", "") or "").strip():
+		fields["Narration"] = "COMMISSION"
+	if not is_actual_receipt_row(fields, row_text):
+		return None
+	fields["Source File"] = source_file
+	fields["Source Page"] = f"{sheet_name}:{row_number}"
+	is_math_valid, math_reason = validate_math_extraction(fields)
+	fields["Math Valid"] = "YES" if is_math_valid else f"NO: {math_reason}"
+	fields["Missing Field and Why"] = build_missing_field_reason(fields)
+	return fields
+
+
+def process_spreadsheet(path: Path, source_hint: Optional[Path] = None, source_display: Optional[str] = None) -> List[ReceiptLineItem]:
+	rows: List[ReceiptLineItem] = []
+	effective_source = source_hint or path
+	effective_display = source_display or str(path)
+	engine = _excel_engine_for_path(path)
+	read_kwargs = {"sheet_name": None, "dtype": object}
+	if engine:
+		read_kwargs["engine"] = engine
+	try:
+		workbook = pd.read_excel(path, **read_kwargs)
+	except Exception as exc:
+		LOGGER.warning("Failed to read spreadsheet %s: %s", path, exc)
+		return rows
+
+	if isinstance(workbook, pd.DataFrame):
+		workbook = {"Sheet1": workbook}
+
+	for sheet_name, sheet_df in workbook.items():
+		if sheet_df is None or sheet_df.empty:
+			continue
+		for row_number, row in sheet_df.iterrows():
+			row_dict = {str(col): row[col] for col in sheet_df.columns if _is_meaningful_excel_value(row.get(col))}
+			if not row_dict:
+				continue
+			fields = _excel_row_to_fields(row_dict, str(effective_display), str(sheet_name), int(row_number) + 2)
+			if not fields:
+				continue
+			rows.append(ReceiptLineItem(values=fields))
+
+	return rows
+
+
 def find_candidate_files(input_path: Path) -> Iterable[Path]:
-	supported = {".pdf", ".jpg", ".jpeg", ".png", ".zip"}
-	if input_path.is_file() and input_path.suffix.lower() in supported:
-		yield input_path
+	supported = {".pdf", ".jpg", ".jpeg", ".png", ".zip", ".xlsx", ".xlsm", ".xlsb", ".xls"}
+	# If a single file is provided, yield it when supported.
+	if input_path.is_file():
+		if input_path.suffix.lower() in supported:
+			LOGGER.debug("Found supported file: %s", input_path)
+			yield input_path
+		else:
+			LOGGER.debug("Skipping unsupported input file: %s", input_path)
 		return
 
+	found = []
+	skipped = []
 	for path in input_path.rglob("*"):
-		if path.is_file() and path.suffix.lower() in supported:
-			yield path
+		if path.is_file():
+			sfx = path.suffix.lower()
+			if sfx in supported:
+				found.append(path)
+			else:
+				skipped.append(path)
+
+	# Log summary for visibility so files aren't silently skipped.
+	if found:
+		LOGGER.info("Discovered %d candidate files under %s", len(found), input_path)
+		for f in found:
+			LOGGER.debug("Found: %s", f)
+	else:
+		LOGGER.warning("No supported files found under %s", input_path)
+
+	if skipped:
+		LOGGER.debug("Skipped %d unsupported files (showing up to 10): %s", len(skipped), skipped[:10])
+
+	for p in found:
+		yield p
 
 
 def extract_text_from_image_file(path: Path) -> List[Tuple[int, str]]:
@@ -2772,108 +4734,75 @@ def split_receipts_from_page_text(page_text: str) -> List[str]:
 
 def validate_math_extraction(row: Dict[str, str]) -> Tuple[bool, str]:
 	"""
-	Validate if extracted amounts match mathematical expectations.
-	Returns (is_valid, reason_for_mismatch)
+	Validate extraction with strict commission math when brokerage is available.
+	Rules:
+	- GST mode must be clearly IGST-only or CGST+SGST/UTGST-only.
+	- GST should be ~18% of brokerage.
+	- Only brokerage and tax fields are used in this validation.
+	Returns (is_valid, reason_for_mismatch).
 	"""
 	try:
-		brok = float((row.get("BROKERAGE Amount", "") or "").replace(",", "")) if (row.get("BROKERAGE Amount", "") or "").strip() else 0.0
-		cgst = float((row.get("CGST @ 9%", "") or "").replace(",", "")) if (row.get("CGST @ 9%", "") or "").strip() else 0.0
-		sgst = float((row.get("SGST @ 9%", "") or "").replace(",", "")) if (row.get("SGST @ 9%", "") or "").strip() else 0.0
-		utgst = float((row.get("UTGST", "") or "").replace(",", "")) if (row.get("UTGST", "") or "").strip() else 0.0
-		igst = float((row.get("IGST", "") or "").replace(",", "")) if (row.get("IGST", "") or "").strip() else 0.0
-		gst_total = float((row.get("GST TOTAL AMT", "") or "").replace(",", "")) if (row.get("GST TOTAL AMT", "") or "").strip() else 0.0
-		total = float((row.get("Total Inv Amt", "") or "").replace(",", "")) if (row.get("Total Inv Amt", "") or "").strip() else 0.0
-		
-		# Explicitly flag rows that don't have enough numeric fields.
-		if brok == 0 and total == 0 and cgst == 0 and sgst == 0 and utgst == 0 and igst == 0 and gst_total == 0:
-			return (False, "NO: Missing monetary values")
-		
-		# Check if total matches brokerage + tax
-		if total > 0 and brok > 0:
-			tax_calc = cgst + sgst + utgst + igst
-			if gst_total > 0 and tax_calc == 0:
-				# Use GST TOTAL AMT if individual taxes are missing
-				tax_calc = gst_total
-			
-			expected_total = brok + tax_calc
-			diff = abs(total - expected_total)
-			tolerance = max(2.0, expected_total * 0.02)  # 2% or 2 points tolerance
-			
-			if diff <= tolerance:
-				return (True, "Math valid")
-			else:
-				return (False, f"Total ({total}) != Brokerage ({brok}) + Tax ({tax_calc}) [diff={diff:.2f}]")
-		
-		# Check if sum of taxes matches GST TOTAL
-		if gst_total > 0:
-			calc_gst = cgst + sgst + utgst + igst
-			if calc_gst == 0:
-				return (True, "GST TOTAL present, individual taxes not separately listed")
-			diff = abs(gst_total - calc_gst)
-			tolerance = max(2.0, gst_total * 0.02)
-			if diff <= tolerance:
-				return (True, "GST sum valid")
-			else:
-				return (False, f"GST TOTAL ({gst_total}) != sum of taxes ({calc_gst}) [diff={diff:.2f}]")
-		
-		missing = []
-		if total <= 0:
-			missing.append("Total Inv Amt")
+		row_copy = dict(row)
+		brok = _amount_to_float(row_copy.get("BROKERAGE Amount", ""))
+		cgst = _amount_to_float(row_copy.get("CGST @ 9%", ""))
+		sgst = _amount_to_float(row_copy.get("SGST @ 9%", ""))
+		utgst = _amount_to_float(row_copy.get("UTGST", ""))
+		igst = _amount_to_float(row_copy.get("IGST", ""))
+		gst_total = _amount_to_float(row_copy.get("GST TOTAL AMT", ""))
+
+		if brok <= 0 and gst_total <= 0 and cgst <= 0 and sgst <= 0 and utgst <= 0 and igst <= 0:
+			return (False, "Missing monetary values")
 		if brok <= 0:
-			missing.append("BROKERAGE Amount")
-		if (cgst + sgst + utgst + igst + gst_total) <= 0:
-			missing.append("Tax fields")
-		if missing:
-			return (False, f"NO: Missing required numbers ({', '.join(missing)})")
+			return (False, "BROKERAGE Amount missing or invalid")
+
+		mode = _detect_clear_tax_mode(row_copy)
+		if mode == "none":
+			if gst_total > 0:
+				return (False, f"Unable to verify GST mode; GST TOTAL={gst_total:.2f}, {_tax_mode_summary(row_copy)}")
+			return (False, f"Unable to verify GST mode; {_tax_mode_summary(row_copy)}")
+
+		if mode == "igst":
+			if igst <= 0:
+				return (False, f"IGST-only mode expected, but IGST is missing; {_tax_mode_summary(row_copy)}")
+			effective_gst = igst
+		else:
+			# CGST + SGST/UTGST mode
+			state_component = sgst if sgst > 0 else utgst
+			if cgst <= 0 or state_component <= 0:
+				return (False, f"CGST + SGST/UTGST mode expected, but one component is missing; {_tax_mode_summary(row_copy)}")
+			
+			# Calculate effective GST as sum of components
+			effective_gst = cgst + state_component
+			
+			# Verify only that the two components are roughly balanced; avoid enforcing a fixed 9% assumption.
+			if abs(cgst - state_component) > max(2.0, max(cgst, state_component) * 0.20):
+				delta = abs(cgst - state_component)
+				return (False, f"CGST {cgst:.2f} and SGST/UTGST {state_component:.2f} are not reasonably balanced by {delta:.2f}")
+
+		expected_gst = brok * 0.18
+		gst_tol = max(2.0, expected_gst * 0.05)
+		if abs(effective_gst - expected_gst) > gst_tol:
+			delta = abs(effective_gst - expected_gst)
+			return (False, f"GST {effective_gst:.2f} differs from 18% of Brokerage {expected_gst:.2f} by {delta:.2f}")
+
+		# Verify GST TOTAL matches the sum of components when it is present.
+		if gst_total > 0 and abs(gst_total - effective_gst) > max(2.0, effective_gst * 0.02):
+			delta = abs(gst_total - effective_gst)
+			return (False, f"GST TOTAL {gst_total:.2f} differs from tax components {effective_gst:.2f} by {delta:.2f}")
+
+		# Intentionally do not enforce a hard 18% brokerage-to-GST ratio here.
 
 		return (True, "Math valid")
 		
 	except (ValueError, TypeError, AttributeError):
-		return (False, "NO: Could not parse amounts for validation")
-
-
-def split_receipts_from_page_text(page_text: str) -> List[str]:
-	separators = [
-		r"\n\s*(?:invoice|tax\s+invoice)\s*(?:no|number)?\b",
-		r"\n\s*vendor\s+inv\s+no\b",
-		r"\n\s*irn\s*(?:no|number)?\b",
-	]
-	chunks = [page_text]
-	for separator in separators:
-		new_chunks: List[str] = []
-		for chunk in chunks:
-			parts = re.split(separator, chunk, flags=re.IGNORECASE)
-			if len(parts) <= 1:
-				new_chunks.append(chunk)
-			else:
-				for i, part in enumerate(parts):
-					if i == 0:
-						# Text before first invoice-like separator is page header context, not a receipt.
-						continue
-					prefixed = "Invoice No " + part
-					if prefixed.strip():
-						new_chunks.append(prefixed)
-		chunks = new_chunks
-
-	filtered: List[str] = []
-	for chunk in chunks:
-		candidate = chunk.strip()
-		if len(candidate) <= 30:
-			continue
-		try:
-			fields = extract_fields(candidate)
-		except Exception:
-			fields = {}
-		has_inv_label = bool(re.search(r"\b(invoice\s*(?:no\.?|number|reference\s*no)|bill\s*(?:no\.?|number)|document\s*no\.?)\b", candidate, re.IGNORECASE))
-		signals = sum(1 for k in ["Vendor Inv No", "Vendor Inv Date", "Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT"] if (fields.get(k, "") or "").strip())
-		if signals >= 2 and (is_valid_invoice_no(fields.get("Vendor Inv No", "")) or has_inv_label):
-			filtered.append(candidate)
-	return filtered if filtered else [page_text]
+		return (False, "Could not parse amounts for validation")
 
 
 def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 	flattened = text.replace("\n", " ")
 	flattened = re.sub(r"\s+", " ", flattened).strip()
+	# Resolve GSTIN roles early so later PAN/state fallbacks can use them safely.
+	balic_gstn, broker_gstn = choose_balic_and_broker_gstin(flattened)
 	# OCR on scanned PDFs can distort the word "invoice" (e.g., lnvoice/lNVOICE).
 	invoice_search_text = flattened
 	invoice_search_text = re.sub(r"\b[il1|]nvoice\b", "invoice", invoice_search_text, flags=re.IGNORECASE)
@@ -3001,6 +4930,8 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 	out_taxable, out_igst, out_total = extract_output_igst_tax_row(flattened)
 	if (not amount_total) and out_total:
 		amount_total = out_total
+	# Probitas label-driven extraction fallback.
+	pb_taxable, pb_cgst, pb_sgst, pb_igst, pb_total = extract_probitas_amounts(flattened)
 	out_igst_preferred = bool(re.search(r"integrated\s*(?:gst|tax)|output\s*igst", flattened, re.IGNORECASE))
 
 	# IGST-only triplet fallback: <taxable> 18% <igst> <total>
@@ -3068,6 +4999,10 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		brokerage = out_taxable
 	if not brokerage and igst_triplet_taxable:
 		brokerage = igst_triplet_taxable
+	if not brokerage and pb_taxable:
+		brokerage = pb_taxable
+	if (not amount_total) and pb_total:
+		amount_total = pb_total
 
 	# Commission-line fallback (common receipt layout)
 	bundle_taxable, bundle_cgst, bundle_sgst, bundle_total = extract_tax_bundle_from_commission_line(flattened)
@@ -3078,6 +5013,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 
 	# NKGSB explicit amount row fallback: Amount taxable cgst sgst igst total
 	nk_taxable, nk_cgst, nk_sgst, nk_igst, nk_total = extract_nkgsb_amount_row(flattened)
+	company_specific_authoritative = False
 	if not brokerage and nk_taxable:
 		brokerage = nk_taxable
 	if (not amount_total) and nk_total:
@@ -3085,6 +5021,10 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 
 	# Dhanlaxmi label-driven table extraction fallback.
 	dh_taxable, dh_cgst, dh_sgst, dh_igst, dh_total = extract_dhanlaxmi_amounts(flattened)
+	if "dhanlaxmi" in flattened.lower() and any([dh_taxable, dh_cgst, dh_sgst, dh_igst, dh_total]):
+		company_specific_authoritative = True
+		brokerage = dh_taxable or brokerage
+		amount_total = dh_total or amount_total
 	if not brokerage and dh_taxable:
 		brokerage = dh_taxable
 	if (not amount_total) and dh_total:
@@ -3127,30 +5067,30 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 
 	# Ideal Insurance table extraction fallback.
 	id_taxable, id_cgst, id_sgst, id_igst, id_total = extract_ideal_amounts(flattened)
-	if id_taxable:
+	if id_taxable and not company_specific_authoritative:
 		brokerage = id_taxable
-	if id_total:
+	if id_total and not company_specific_authoritative:
 		amount_total = id_total
 
 	# Mahindra Insurance table extraction fallback.
 	mh_taxable, mh_cgst, mh_sgst, mh_igst, mh_total = extract_mahindra_amounts(flattened)
-	if mh_taxable:
+	if mh_taxable and not company_specific_authoritative:
 		brokerage = mh_taxable
-	if mh_total:
+	if mh_total and not company_specific_authoritative:
 		amount_total = mh_total
 
 	# Bajaj Housing Finance table extraction fallback.
 	bh_taxable, bh_cgst, bh_sgst, bh_igst, bh_total = extract_bajaj_housing_amounts(flattened)
-	if bh_taxable:
+	if bh_taxable and not company_specific_authoritative:
 		brokerage = bh_taxable
-	if bh_total:
+	if bh_total and not company_specific_authoritative:
 		amount_total = bh_total
 
 	# Coverkraft table extraction fallback.
 	ck_taxable, ck_cgst, ck_sgst, ck_igst, ck_total = extract_coverkraft_amounts(flattened)
-	if ck_taxable:
+	if ck_taxable and not company_specific_authoritative:
 		brokerage = ck_taxable
-	if ck_total:
+	if ck_total and not company_specific_authoritative:
 		amount_total = ck_total
 
 	# HSN row fallback for common 9%+9% brokerage tables.
@@ -3164,8 +5104,6 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 
 	# Generic five-number amount row fallback (common in OCR'd tax tables)
 	gen_taxable, gen_cgst, gen_sgst, gen_igst, gen_gst_total = extract_generic_tax_amount_row(flattened)
-	if (not brokerage) and gen_taxable:
-		brokerage = gen_taxable
 
 	# Credit Note row fallback: Taxable Value / CGST / SGST / IGST / Total Value.
 	cn_taxable, cn_cgst, cn_sgst, cn_igst, cn_total = extract_credit_note_tax_row(flattened)
@@ -3194,62 +5132,97 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		brokerage = jk_taxable
 	if (not amount_total) and jk_total:
 		amount_total = jk_total
+
+	specific_taxable_hit = any([
+		nk_taxable,
+		dh_taxable,
+		cu_taxable,
+		pb_taxable,
+		et_taxable,
+		ca_taxable,
+		ic_taxable,
+		jb_taxable,
+		id_taxable,
+		mh_taxable,
+		bh_taxable,
+		ck_taxable,
+		hsn_taxable,
+		cn_taxable,
+		sum_taxable,
+		mot_taxable,
+		jk_taxable,
+		igst_taxable,
+		out_taxable,
+		igst_triplet_taxable,
+	])
+	specific_state_cgst = next((v for v in [dh_cgst, nk_cgst, cu_cgst, pb_cgst, et_cgst, ca_cgst, ic_cgst, jb_cgst, id_cgst, mh_cgst, bh_cgst, ck_cgst, hsn_cgst, cn_cgst, sum_cgst, bundle_cgst] if v), "")
+	specific_state_sgst = next((v for v in [dh_sgst, nk_sgst, cu_sgst, pb_sgst, et_sgst, ca_sgst, ic_sgst, jb_sgst, id_sgst, mh_sgst, bh_sgst, ck_sgst, hsn_sgst, cn_sgst, sum_sgst, bundle_sgst] if v), "")
+	if (specific_state_cgst or specific_state_sgst) and not company_specific_authoritative:
+		company_specific_authoritative = True
+	if (not brokerage) and (not specific_taxable_hit) and gen_taxable:
+		brokerage = gen_taxable
 	
 	# Prefer IGST extraction first for Axis/DBS layouts and compact table rows (amount before rate).
-	igst = clean_amount(find_first([
-		r"\bigst\s*@?\s*\d{1,2}(?:\.\d+)?\s*%\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
-	], flattened))
-	if not igst:
-		igst = clean_amount(extract_tax_amount(flattened, "IGST"))
-	if not igst:
-		igst = clean_amount(find_first([
-			r"igst\s*(?:rate\s*)?(?:amt|amount)?\s*[:\-]?\s*([0-9,]+(?:\.\d{1,2})?)",
-			r"\d{1,2}(?:\.\d+)?\s*%\s*([0-9,]+(?:\.\d{1,2})?)\s+(?:total\s*invoice\s*value|total\s*amount)",
-		], flattened))
-	if (not igst) and igst_bundle_amount:
-		igst = igst_bundle_amount
-	if (not igst) and out_igst:
-		igst = out_igst
-	if out_igst_preferred and out_igst:
-		igst = out_igst
-		if out_taxable:
-			brokerage = out_taxable
-		if out_total:
-			amount_total = out_total
-	if (not igst) and igst_triplet_tax:
-		igst = igst_triplet_tax
-	if (not igst) and nk_igst:
-		igst = nk_igst
-	if (not igst) and jk_igst:
-		igst = jk_igst
-	if (not igst) and gen_igst:
-		igst = gen_igst
-	if (not igst) and cn_igst:
-		igst = cn_igst
-	if (not igst) and sum_igst:
-		igst = sum_igst
-	if (not igst) and mot_igst:
-		igst = mot_igst
-	if (not igst) and dh_igst:
+	igst = ""
+	if company_specific_authoritative:
 		igst = dh_igst
-	if (not igst) and cu_igst:
-		igst = cu_igst
-	if (not igst) and et_igst:
-		igst = et_igst
-	if (not igst) and ca_igst:
-		igst = ca_igst
-	if (not igst) and ic_igst:
-		igst = ic_igst
-	if (not igst) and jb_igst:
-		igst = jb_igst
-	if (not igst) and id_igst:
-		igst = id_igst
-	if (not igst) and mh_igst:
-		igst = mh_igst
-	if (not igst) and bh_igst:
-		igst = bh_igst
-	if (not igst) and ck_igst:
-		igst = ck_igst
+	else:
+		igst = clean_amount(find_first([
+			r"\bigst\s*@?\s*\d{1,2}(?:\.\d+)?\s*%\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
+		], flattened))
+		if not igst:
+			igst = clean_amount(extract_tax_amount(flattened, "IGST"))
+		if not igst:
+			igst = clean_amount(find_first([
+				r"igst\s*(?:rate\s*)?(?:amt|amount)?\s*[:\-]?\s*([0-9,]+(?:\.\d{1,2})?)",
+				r"\d{1,2}(?:\.\d+)?\s*%\s*([0-9,]+(?:\.\d{1,2})?)\s+(?:total\s*invoice\s*value|total\s*amount)",
+			], flattened))
+		if (not igst) and igst_bundle_amount:
+			igst = igst_bundle_amount
+		if (not igst) and out_igst:
+			igst = out_igst
+		if out_igst_preferred and out_igst:
+			igst = out_igst
+			if out_taxable:
+				brokerage = out_taxable
+			if out_total:
+				amount_total = out_total
+		if (not igst) and igst_triplet_tax:
+			igst = igst_triplet_tax
+		if (not igst) and nk_igst:
+			igst = nk_igst
+		if (not igst) and jk_igst:
+			igst = jk_igst
+		if (not igst) and cn_igst:
+			igst = cn_igst
+		if (not igst) and sum_igst:
+			igst = sum_igst
+		if (not igst) and mot_igst:
+			igst = mot_igst
+		if (not igst) and (not specific_taxable_hit) and gen_igst:
+			igst = gen_igst
+		if (not igst) and dh_igst:
+			igst = dh_igst
+		if (not igst) and cu_igst:
+			igst = cu_igst
+		if (not igst) and pb_igst:
+			igst = pb_igst
+		if (not igst) and et_igst:
+			igst = et_igst
+		if (not igst) and ca_igst:
+			igst = ca_igst
+		if (not igst) and ic_igst:
+			igst = ic_igst
+		if (not igst) and jb_igst:
+			igst = jb_igst
+		if (not igst) and id_igst:
+			igst = id_igst
+		if (not igst) and mh_igst:
+			igst = mh_igst
+		if (not igst) and bh_igst:
+			igst = bh_igst
+		if (not igst) and ck_igst:
+			igst = ck_igst
 	try:
 		if igst and float(igst.replace(",", "")) <= 0:
 			igst = ""
@@ -3279,7 +5252,13 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 	except (ValueError, AttributeError):
 		igst_num = 0
 
-	if not (has_igst_layout and igst_num > 10):
+	if company_specific_authoritative:
+		cgst = specific_state_cgst
+		sgst = specific_state_sgst
+		utgst = ""
+		if igst and (cgst or sgst):
+			igst = ""
+	elif not (has_igst_layout and igst_num > 10):
 		# Extract tax amounts using helper that focuses on amounts not percentages
 		cgst = clean_amount(extract_tax_amount(flattened, "CGST"))
 		if not cgst or float(cgst) <= 10:
@@ -3408,6 +5387,16 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 			if not sgst:
 				sgst = utgst
 			utgst = ""
+
+		# Amount-led disambiguation: if CGST and SGST are both present and near-equal,
+		# prefer state-tax mapping and clear IGST regardless of label noise.
+		try:
+			cg_num = float(cgst.replace(",", "")) if cgst else 0.0
+			sg_num = float(sgst.replace(",", "")) if sgst else 0.0
+			if cg_num > 0 and sg_num > 0 and abs(cg_num - sg_num) <= max(2.0, max(cg_num, sg_num) * 0.08):
+				igst = ""
+		except (ValueError, TypeError):
+			pass
 	else:
 		# IGST-only invoice: clear state-tax fields.
 		cgst = ""
@@ -3495,6 +5484,12 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 	if (not amount_total) and igst_triplet_total:
 		amount_total = igst_triplet_total
 
+	has_direct_monetary_basis = bool(re.search(
+		r"taxable\s*value|brokerage\s*amount|commission\s*amount|total\s*amount\s*(?:after\s*tax|payable)|gst\s*total\s*amt|igst\s*@|cgst\s*@|sgst\s*@",
+		flattened,
+		re.IGNORECASE,
+	))
+
 	# Deterministic fallback: if taxable and total are present but all GST fields are missing,
 	# derive GST from (total - taxable) when the ratio is plausible.
 	try:
@@ -3506,7 +5501,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		ig_num = float(igst.replace(",", "")) if igst else 0.0
 		gst_num = float(gst_total.replace(",", "")) if gst_total else 0.0
 
-		if brok_num > 0 and total_num > 0 and (cg_num + sg_num + ut_num + ig_num + gst_num) == 0:
+		if has_direct_monetary_basis and brok_num > 0 and total_num > 0 and (cg_num + sg_num + ut_num + ig_num + gst_num) == 0:
 			inferred_gst = total_num - brok_num
 			ratio = inferred_gst / brok_num if brok_num else 0.0
 			if inferred_gst > 0 and 0.05 <= ratio <= 0.30:
@@ -3538,7 +5533,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 			ut_num = float(utgst.replace(",", "")) if utgst else 0.0
 			state_tax = max(sg_num, ut_num)
 			gst_num = ig_num if ig_num > 0 else (cg_num + state_tax)
-		if brok_num > 0 and gst_num > 0 and total_num <= 0:
+		if has_direct_monetary_basis and brok_num > 0 and gst_num > 0 and total_num <= 0:
 			tax_ratio = gst_num / brok_num if brok_num else 0.0
 			if 0.05 <= tax_ratio <= 0.30:
 				amount_total = f"{(brok_num + gst_num):.2f}"
@@ -3559,7 +5554,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		if gst_num <= 0:
 			gst_num = ig_num if ig_num > 0 else (cg_num + state_tax)
 
-		if brok_num <= 0 and total_num > 0 and gst_num > 0 and total_num > gst_num:
+		if has_direct_monetary_basis and brok_num <= 0 and total_num > 0 and gst_num > 0 and total_num > gst_num:
 			inferred_brok = total_num - gst_num
 			ratio = gst_num / inferred_brok if inferred_brok else 0.0
 			if inferred_brok > 0 and 0.05 <= ratio <= 0.30:
@@ -3581,7 +5576,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		sg_num = float(sgst.replace(",", "")) if sgst else 0.0
 		ut_num = float(utgst.replace(",", "")) if utgst else 0.0
 
-		if brok_num <= 0 and total_num <= 0:
+		if has_direct_monetary_basis and brok_num <= 0 and total_num <= 0:
 			# IGST-only recovery.
 			if ig_num > 0 and (cg_num + sg_num + ut_num) == 0:
 				inferred_brok = ig_num / 0.18
@@ -3609,27 +5604,25 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		r"(?:pan|p\.a\.n)\.?\s*[:\-]?\s*([A-Z]{5}[0-9]{4}[A-Z])\b",
 		r"\b([A-Z]{5}[0-9]{4}[A-Z])\b(?=\s+(?:is|are|the|of|agent))",
 	], flattened)
+	if not agent_pan:
+		broker_pan = gstin_to_pan(broker_gstn)
+		if broker_pan and broker_pan != BALIC_PAN:
+			agent_pan = broker_pan
+	if agent_pan == BALIC_PAN:
+		broker_pan = gstin_to_pan(broker_gstn)
+		if broker_pan and broker_pan != BALIC_PAN:
+			agent_pan = broker_pan
 	
-	# Sanity auto-correction uses arithmetic; keep it opt-in only.
-	if allow_arithmetic_autofill():
-		cgst, sgst, utgst, igst = validate_and_correct_taxes(brokerage, cgst, sgst, utgst, igst)
-	
+	# Arithmetic autofill remains opt-in; suspicious values are validated downstream.
+
 	if allow_arithmetic_autofill():
 		# Recalculate GST TOTAL after sanity check
-		# Also normalize noisy CGST/SGST pairs that are close to rates or internally inconsistent.
+		# Keep extracted tax components unchanged; downstream validation will flag suspicious ratios.
 		try:
 			brokerage_num = float(brokerage.replace(",", "")) if brokerage else 0
 			cgst_num = float(cgst.replace(",", "")) if cgst else 0
 			sgst_num = float(sgst.replace(",", "")) if sgst else 0
-			if brokerage_num > 100 and cgst_num > 0 and sgst_num > 0:
-				expected = brokerage_num * 0.09
-				bad_pair = abs(cgst_num - sgst_num) > max(cgst_num, sgst_num) * 0.35
-				rate_like = (cgst_num <= 30 and sgst_num <= 30 and expected > 100)
-				if bad_pair or rate_like:
-					cgst = f"{expected:.2f}"
-					sgst = f"{expected:.2f}"
-					utgst = ""
-					igst = ""
+			_ = (brokerage_num, cgst_num, sgst_num)
 		except (ValueError, AttributeError):
 			pass
 
@@ -3839,7 +5832,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 
 	# Bajaj mapping correction: some layouts map taxable value into Total Inv Amt.
 	# When Total Inv Amt looks like a tax component, clear it (do not compute).
-	if "bajaj" in flattened.lower() and ("housing finance" in flattened.lower() or "bajaj auto" in flattened.lower()):
+	if extract_bajaj_company_name(flattened):
 		try:
 			total_num = float(amount_total.replace(",", "")) if amount_total else 0
 			cg_num = float(cgst.replace(",", "")) if cgst else 0
@@ -3962,7 +5955,7 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 			r"customer\s*name\s*[:\-]?\s*([A-Za-z][A-Za-z\s&.,()'/-]{4,80}?(?:Limited|Ltd))",
 		], flattened))
 		if customer_name:
-			service_recipient = normalize_balic_company_name(customer_name)
+			service_recipient = normalize_balic_service_recipient_name(customer_name, flattened)
 
 		ip_date = find_first([
 			r"invoice\s*date\s*[:\-]?\s*([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4})",
@@ -4067,30 +6060,54 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 	if not agent_pan:
 		agent_pan = find_first([r"\b([A-Z]{5}[0-9]{4}[A-Z])\b"], flattened)
 
-	# Try to capture GSTIN field (both as balic_gstn and broker_gstn from GSTIN field)
-	# GSTIN format: 2 digits + 13 alphanumeric chars = 15 total, ending with check digit
-	# Find all valid GSTINs and filter out incomplete ones
-	all_gstins = re.findall(r"([0-9]{2}[A-Z0-9]{13})", flattened)
-	# Filter to keep only legitimate GSTINs (exclude partial matches of CIN numbers)
-	gstin_values = [g for g in all_gstins if re.match(r"[0-9]{2}[A-Z0-9]{11}[A-Z0-9]", g)]
-	balic_gstn = gstin_values[0] if len(gstin_values) >= 1 else find_first([r"balic\s*gstn\s*[:\-]?\s*([0-9A-Z]{15})"], flattened)
-	broker_gstn = gstin_values[-1] if len(gstin_values) > 1 else (gstin_values[0] if gstin_values else find_first([r"broker\s*gstn\s*[:\-]?\s*([0-9A-Z]{15})"], flattened))
+	# Extract SAC code with label anchoring to avoid table-row HSN leakage.
+	sac_code = find_first([
+		r"(?:service\s+accounting\s+code|sac\s*code)\s*[:\-]?\s*([0-9]{4,8})",
+		r"\b(?:sac)\s*[:\-]?\s*([0-9]{6,8})\b",
+	], flattened)
 	
-	# Extract SAC code and date ranges from narration
-	sac_code = find_first([r"(?:sac\s*code|sac|hsn\s*code|hsn)\s*[:\-]?\s*([0-9]{4,8})"], flattened)
-	
-	# Extract date range from narration "01 to 31 Oct'2025"
+	# Extract date ranges from narration/header.
 	date_from = ""
 	date_to = ""
-	date_range_match = re.search(r"(\d{2})\s+(?:to|through)\s+(\d{2})\s+([A-Za-z]{3,9})['\"]?([0-9]{4})", flattened)
+	date_range_match = re.search(r"(\d{2})\s+(?:to|through)\s+(\d{2})\s+([A-Za-z]{3,9})['\"]?([0-9]{2,4})", flattened)
 	if date_range_match:
 		day_from, day_to, month_name, year = date_range_match.groups()
+		if len(year) == 2:
+			year = f"20{year}"
 		month_map = {"jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
 		            "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"}
 		month_num = month_map.get(month_name[:3].lower(), "")
 		if month_num:
 			date_from = f"{day_from}/{month_num}/{year}"
 			date_to = f"{day_to}/{month_num}/{year}"
+
+	if not date_from or not date_to:
+		dmy_range = re.search(
+			r"([0-3]?\d[./-][01]?\d[./-](?:\d{2}|\d{4}))\s*(?:to|through|till|-)\s*([0-3]?\d[./-][01]?\d[./-](?:\d{2}|\d{4}))",
+			flattened,
+			re.IGNORECASE,
+		)
+		if dmy_range:
+			date_from = try_parse_date(dmy_range.group(1))
+			date_to = try_parse_date(dmy_range.group(2))
+
+	if not date_from or not date_to:
+		month_period = re.search(
+			r"\b(?:for\s+the\s+month\s+of|month\s+of|period\s+of|commission\s+for\s+the\s+month\s+of|brokerage\s+for\s+the\s+month\s+of)\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)\s*['’\-/]?\s*(\d{2,4})\b",
+			flattened,
+			re.IGNORECASE,
+		)
+		if month_period:
+			mon, year = month_period.groups()
+			month_map = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+			month_num = month_map.get(mon[:3].lower(), 0)
+			if month_num:
+				year_num = int(year)
+				if year_num < 100:
+					year_num += 2000
+				last_day = calendar.monthrange(year_num, month_num)[1]
+				date_from = f"01/{month_num:02d}/{year_num}"
+				date_to = f"{last_day:02d}/{month_num:02d}/{year_num}"
 	
 	# Fallback to generic date range extraction
 	if not date_from:
@@ -4133,26 +6150,16 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 	if not service_recipient:
 		service_recipient = extract_company_from_address_start(flattened)
 
-	agent_name = find_first(
-		[
-			r"(?:Bajaj\s+Housing\s+Finance|Bajaj\s+[A-Za-z\s&]+(?:Limited|Ltd))",
-			r"agent\s*name\s*[:\-]?\s*([A-Z][A-Za-z .,&()-]{3,})",
-		],
-		flattened,
-	)
+	agent_name = find_first([
+		r"agent\s*name\s*[:\-]?\s*([A-Z][A-Za-z .,&()-]{3,})",
+	], flattened)
+	if not agent_name:
+		agent_name = extract_bajaj_company_name(flattened)
 	if not agent_name:
 		agent_name = service_recipient
-	if not agent_name and re.search(r"bajaj\s+life\s+insurance", flattened, re.IGNORECASE):
-		agent_name = "Bajaj Allianz Life Insurance Company Ltd"
 
 	agent_name = normalize_balic_company_name(agent_name)
-	service_recipient = normalize_balic_company_name(service_recipient)
-	if re.search(r"bajaj\s+allianz\s+life\s+insurance|bajaj\s+life\s+insurance", flattened, re.IGNORECASE):
-		service_recipient = "Bajaj Allianz Life Insurance Company Ltd"
-	if not service_recipient:
-		service_recipient = agent_name
-	if not service_recipient and re.search(r"bajaj\s+life\s+insurance", flattened, re.IGNORECASE):
-		service_recipient = "Bajaj Allianz Life Insurance Company Ltd"
+	service_recipient = normalize_balic_service_recipient_name(service_recipient, flattened)
 
 	balic_state = extract_state_from_text(flattened)
 	broker_state_raw = find_first([
@@ -4160,14 +6167,34 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		r"broker\s*state\s*[:\-]?\s*([A-Za-z ]{2,40})",
 	], flattened)
 	broker_state = normalize_state_name(broker_state_raw)
+	if balic_gstn:
+		balic_state = gstin_to_state_name(balic_gstn)
+	if broker_gstn:
+		broker_state = gstin_to_state_name(broker_gstn)
 	if not balic_state and broker_state:
 		balic_state = broker_state
 
+	# Try to extract AGENT_CODE from text, or use similarity matching
+	extracted_agent_code = find_first([
+		r"(?:agent\s*code|ag\.?\s*code|agent\s*id|code)\s*[:\-]?\s*([A-Z0-9\-/]+)",
+	], flattened)
+	
+	# If not found in text, try similarity matching on agent name
+	final_agent_code = extracted_agent_code
+	final_agent_name = agent_name
+	
+	if not final_agent_code and agent_name:
+		matched_code, clean_name, similarity = find_best_matching_agent_code(agent_name)
+		if matched_code:
+			final_agent_code = matched_code
+			final_agent_name = clean_name
+			LOGGER.debug("Matched agent '%s' to code %s (similarity: %.2f)", agent_name, matched_code, similarity)
+
 	row = {
-		"AGENT_CODE": find_first([r"agent\s*code\s*[:\-]?\s*([A-Z0-9\-/]+)"], flattened),
-		"Agent Name": agent_name,
+		"AGENT_CODE": final_agent_code,
+		"Agent Name": final_agent_name,
 		"Agent PAN": agent_pan,
-		"Name of Service Receipient": service_recipient,
+		"Name of Service Receipient": normalize_balic_service_recipient_name(service_recipient, flattened),
 		"BALIC STATE": balic_state,
 		"BALIC GSTN": balic_gstn,
 		"BROKER GSTN STATE": broker_state,
@@ -4192,6 +6219,10 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
 		"Micro/Non Micro": "",
 		"SAC Code": sac_code,
 	}
+	if row["AGENT_CODE"] and not re.search(r"\d", row["AGENT_CODE"]):
+		row["AGENT_CODE"] = ""
+	if row["Agent PAN"] == BALIC_PAN:
+		row["Agent PAN"] = ""
 
 	if not row["Type"]:
 		row["Type"] = find_first([r"\btype\s*[:\-]?\s*([A-Z ]{3,})"], flattened)
@@ -4240,6 +6271,10 @@ def is_actual_receipt_row(fields: Dict[str, str], receipt_text: str) -> bool:
 		bool(clean_amount(fields.get(k, "")))
 		for k in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]
 	)
+	meaningful_identity = any(
+		bool((fields.get(k, "") or "").strip())
+		for k in ["Agent Name", "AGENT_CODE", "Agent PAN", "Name of Service Receipient", "BALIC GSTN", "BROKER GSTN"]
+	)
 	receipt_label = bool(
 		re.search(
 			r"\b(invoice\s*(?:no\.?|number|reference\s*no)|bill\s*(?:no\.?|number)|document\s*no\.?)\b",
@@ -4247,7 +6282,184 @@ def is_actual_receipt_row(fields: Dict[str, str], receipt_text: str) -> bool:
 			re.IGNORECASE,
 		)
 	)
-	return invoice_ok and (date_ok or has_amount or receipt_label)
+	if not (invoice_ok or date_ok or has_amount or meaningful_identity):
+		return False
+	if invoice_ok:
+		return date_ok or has_amount or receipt_label
+	# Allow monetary-only continuation rows; invoice can be recovered later by cross-page reconciliation.
+	return has_amount and (date_ok or receipt_label)
+
+
+def _is_bajaj_finance_context(text: str) -> bool:
+	raw = (text or "").lower()
+	has_finance = bool(re.search(r"\bbajaj\s+finance\b", raw))
+	has_housing = bool(re.search(r"\bbajaj\s+housing\b", raw))
+	return has_finance and not has_housing
+
+
+def _is_bajaj_finance_row(fields: Dict[str, str]) -> bool:
+	candidates = " ".join(
+		[
+			(fields.get("Name of Service Receipient", "") or ""),
+			(fields.get("Agent Name", "") or ""),
+			(fields.get("Narration", "") or ""),
+		]
+	)
+	if _is_bajaj_finance_context(candidates):
+		return True
+	company = extract_bajaj_company_name(candidates)
+	return normalize_bajaj_company_name(company) == "Bajaj Finance Limited"
+
+
+def _is_bajaj_finance_total_row(receipt_text: str, fields: Dict[str, str]) -> bool:
+	haystack = " ".join(
+		[
+			receipt_text or "",
+			(fields.get("Agent Name", "") or ""),
+			(fields.get("Narration", "") or ""),
+			(fields.get("Name of Service Receipient", "") or ""),
+		]
+	)
+	if not _is_bajaj_finance_context(haystack) and not _is_bajaj_finance_row(fields):
+		return False
+	particulars_total = bool(
+		re.search(r"\bparticulars?\b.{0,120}\btotal\b|\btotal\b.{0,120}\bparticulars?\b", haystack, re.IGNORECASE | re.DOTALL)
+	)
+	row_has_amount = any(
+		bool(clean_amount(fields.get(k, "")))
+		for k in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]
+	)
+	return particulars_total and row_has_amount
+
+
+def _amount_to_float(value: str) -> float:
+	text = (clean_amount(value) or "").replace(",", "").strip()
+	if not text:
+		return 0.0
+	try:
+		return float(text)
+	except (TypeError, ValueError):
+		return 0.0
+
+
+def _monetary_profile(row: Dict[str, str]) -> Tuple[float, float, float]:
+	total = _amount_to_float(row.get("Total Inv Amt", ""))
+	brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+	cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+	sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+	utgst = _amount_to_float(row.get("UTGST", ""))
+	igst = _amount_to_float(row.get("IGST", ""))
+	gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+	state_tax = max(sgst, utgst)
+	tax = igst if igst > 0 else (cgst + state_tax)
+	if tax <= 0 and gst_total > 0:
+		tax = gst_total
+	return total, brok, tax
+
+
+def _same_line_item_by_amount(current_row: Dict[str, str], previous_row: Dict[str, str]) -> bool:
+	"""Return True when two rows look like the same line item by monetary signature."""
+	if not previous_row:
+		return False
+	cur_total, cur_brok, cur_tax = _monetary_profile(current_row)
+	prev_total, prev_brok, prev_tax = _monetary_profile(previous_row)
+
+	if cur_total > 0 and prev_total > 0 and abs(cur_total - prev_total) <= 1.0:
+		return True
+	if cur_brok > 0 and prev_brok > 0 and abs(cur_brok - prev_brok) <= 1.0:
+		if cur_tax > 0 and prev_tax > 0:
+			return abs(cur_tax - prev_tax) <= 1.0
+		return True
+	return False
+
+
+def _is_high_value_row(row: Dict[str, str]) -> bool:
+	total = _amount_to_float(row.get("Total Inv Amt", ""))
+	brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+	gst = _amount_to_float(row.get("GST TOTAL AMT", ""))
+	return total >= 200000 or brok >= 150000 or gst >= 30000
+
+
+def _should_ai_override_monetary(existing: Dict[str, str], ai_row: Dict[str, str]) -> bool:
+	"""Use LLM row as validator/corrector only when regex row fails and AI row passes."""
+	try:
+		existing_valid, _ = validate_math_extraction(existing)
+		ai_valid, _ = validate_math_extraction(ai_row)
+		if (not existing_valid) and ai_valid:
+			return True
+	except Exception:
+		return False
+	return False
+
+
+def _should_ai_override_identity(existing: Dict[str, str], ai_row: Dict[str, str]) -> bool:
+	"""Allow identity replacement only when AI resolves a detected GSTIN-role conflict."""
+	return _has_gstin_role_conflict(existing) and (not _has_gstin_role_conflict(ai_row))
+
+
+def _monetary_signal_score(row: Dict[str, str]) -> int:
+	score = 0
+	if _amount_to_float(row.get("BROKERAGE Amount", "")) > 0:
+		score += 2
+	if _amount_to_float(row.get("Total Inv Amt", "")) > 0:
+		score += 2
+	if _amount_to_float(row.get("GST TOTAL AMT", "")) > 0:
+		score += 2
+	if _detect_clear_tax_mode(row) in {"igst", "state"}:
+		score += 2
+	try:
+		ok, _ = validate_math_extraction(row)
+		if ok:
+			score += 4
+	except Exception:
+		pass
+	return score
+
+
+def _backfill_brokerage_from_total_and_gst(row: Dict[str, str]) -> Dict[str, str]:
+	result = dict(row)
+	brok = _amount_to_float(result.get("BROKERAGE Amount", ""))
+	total = _amount_to_float(result.get("Total Inv Amt", ""))
+	gst_total = _amount_to_float(result.get("GST TOTAL AMT", ""))
+	if brok <= 0 and total > 0 and gst_total > 0 and total > gst_total:
+		inferred = total - gst_total
+		if inferred > 0:
+			ratio = gst_total / inferred
+			if 0.16 <= ratio <= 0.20:
+				result["BROKERAGE Amount"] = _fmt_amount(inferred)
+	return result
+
+
+def _reconcile_regex_ai_monetary(existing: Dict[str, str], ai_row: Dict[str, str]) -> Dict[str, str]:
+	"""Cross-verify regex and AI rows; keep the stronger monetary mapping and backfill gaps from the other."""
+	mcols = [
+		"BROKERAGE Amount",
+		"Total Inv Amt",
+		"GST TOTAL AMT",
+		"CGST @ 9%",
+		"SGST @ 9%",
+		"UTGST",
+		"IGST",
+	]
+
+	existing_norm = apply_confident_math_fill(enforce_tax_mode_fields(_backfill_brokerage_from_total_and_gst(existing)))
+	ai_norm = apply_confident_math_fill(enforce_tax_mode_fields(_backfill_brokerage_from_total_and_gst(ai_row)))
+
+	existing_score = _monetary_signal_score(existing_norm)
+	ai_score = _monetary_signal_score(ai_norm)
+
+	primary = existing_norm if existing_score >= ai_score else ai_norm
+	secondary = ai_norm if primary is existing_norm else existing_norm
+
+	result = dict(primary)
+	for col in mcols:
+		if not (result.get(col, "") or "").strip() and (secondary.get(col, "") or "").strip():
+			result[col] = secondary[col]
+
+	result = apply_confident_math_fill(result)
+	result = enforce_tax_mode_fields(result)
+	result = apply_gst_autofill(result)
+	return result
 
 
 def merge_page_fallback_fields(row: Dict[str, str], page_fields: Dict[str, str]) -> Dict[str, str]:
@@ -4285,6 +6497,10 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
 	rows: List[ReceiptLineItem] = []
 	effective_source = source_hint or path
 	effective_display = source_display or str(path)
+	last_invoice_no = ""
+	last_identity_fields: Dict[str, str] = {}
+	last_invoice_basis: Dict[str, str] = {}
+	is_bajaj_finance_file = _is_bajaj_finance_context(source_display or str(path))
 
 	effective_password = override_password or infer_password_from_path(effective_source)
 	page_texts = pdf_page_texts(pdf_bytes, str(path), effective_password)
@@ -4321,79 +6537,196 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
 			continue
 		
 		is_axis = "axis" in effective_display.lower() and "bank" in effective_display.lower()
-		page_fields = extract_fields(page_text, is_axis_bank=is_axis)
-		receipts = [page_text] if is_india_post_source(effective_source) else split_receipts_from_page_text(page_text)
+		page_ocr_score = score_ocr_text(page_text)
+		low_conf_page = page_ocr_score < MIN_OCR_ALNUM_SCORE
+		page_fields = {} if low_conf_page else extract_fields(page_text, is_axis_bank=is_axis)
+		receipts = [page_text] if (is_india_post_source(effective_source) or low_conf_page) else split_receipts_from_page_text(page_text)
 		page_rows: List[Dict[str, str]] = []
-		for receipt_text in receipts:
-			fields = extract_fields(receipt_text, is_axis_bank=is_axis)
-			fields = merge_page_fallback_fields(fields, page_fields)
-			fields = apply_party_overrides(fields, effective_source, f"{effective_display} {page_text} {receipt_text}")
-			fields = backfill_agent_pan(fields, f"{effective_display} {page_text} {receipt_text}")
-			if (fields.get("Narration", "") or "").strip().upper() == "COMMISSION":
-				inferred_narr = infer_narration_from_source_name(effective_display)
-				if inferred_narr:
-					fields["Narration"] = inferred_narr
-			fields = normalize_mapping_anomalies(fields, f"{effective_display} {page_text} {receipt_text}", effective_source)
-			from_name = infer_invoice_no_from_source_name(effective_display)
-			current_inv = (fields.get("Vendor Inv No", "") or "").strip()
-			has_receipt_signal = bool(
-				re.search(
-					r"\b(invoice\s*(?:no\.?|number|reference\s*no)|bill\s*(?:no\.?|number)|document\s*no\.?)\b",
-					receipt_text,
-					re.IGNORECASE,
+		ai_first = bool(get_azure_openai_config())
+		ai_rows_first: List[Dict[str, str]] = []
+		if ai_first:
+			LOGGER.info("Running Azure mini extraction early for %s page %s", effective_display, page_num)
+			ai_rows_first = extract_receipts_with_azure_llm(page_text, effective_display, page_num, _gst_mode_context_hint(page_rows) if page_rows else "")
+			for ai_row in ai_rows_first:
+				ai_row = merge_page_fallback_fields(ai_row, page_fields)
+				ai_row = apply_party_overrides(ai_row, effective_source, page_text)
+				ai_row = backfill_agent_pan(ai_row, page_text)
+				ai_row = normalize_mapping_anomalies(ai_row, page_text, effective_source)
+				ai_row = enforce_tax_mode_fields(ai_row)
+				if not is_actual_receipt_row(ai_row, page_text):
+					continue
+				page_rows.append(ai_row)
+		if not page_rows:
+			for receipt_text in receipts:
+				receipt_ocr_score = score_ocr_text(receipt_text)
+				low_conf_receipt = receipt_ocr_score < MIN_OCR_ALNUM_SCORE
+				if low_conf_receipt:
+					continue
+				fields = extract_fields(receipt_text, is_axis_bank=is_axis)
+				fields = merge_page_fallback_fields(fields, page_fields)
+				doc_context = f"{page_text} {receipt_text}"
+				fields = apply_party_overrides(fields, effective_source, doc_context)
+				fields = backfill_agent_pan(fields, doc_context)
+				if (fields.get("Narration", "") or "").strip().upper() == "COMMISSION":
+					inferred_narr = infer_narration_from_source_name(effective_display)
+					if inferred_narr:
+						fields["Narration"] = inferred_narr
+				fields = normalize_mapping_anomalies(fields, doc_context, effective_source)
+				fields = enforce_tax_mode_fields(fields)
+				from_name = infer_invoice_no_from_source_name(effective_display)
+				current_inv = (fields.get("Vendor Inv No", "") or "").strip()
+				has_receipt_signal = bool(
+					re.search(
+						r"\b(invoice\s*(?:no\.?|number|reference\s*no)|bill\s*(?:no\.?|number)|document\s*no\.?)\b",
+						receipt_text,
+						re.IGNORECASE,
+					)
+				) or bool((fields.get("Vendor Inv Date", "") or "").strip()) or any(
+					bool(clean_amount(fields.get(k, "")))
+					for k in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]
 				)
-			) or bool((fields.get("Vendor Inv Date", "") or "").strip()) or any(
-				bool(clean_amount(fields.get(k, "")))
-				for k in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]
-			)
 			
-			# If invoice number is still blank, try OCR fallback on the page
-			if not current_inv and len(page_text.strip()) > 20:
-				try:
-					# Apply OCR to this specific page as fallback.
-					image = render_pdf_page_image(pdf_bytes, page_num, dpi=300)
-					if image is not None:
-						ocr_text = ocr_image(image, prefer_google=True)
-						if len(ocr_text.strip()) > 20:
-							ocr_fields = extract_fields(ocr_text, is_axis_bank=is_axis)
-							ocr_inv = (ocr_fields.get("Vendor Inv No", "") or "").strip()
-							if ocr_inv and is_valid_invoice_no(ocr_inv):
-								fields["Vendor Inv No"] = ocr_inv
-								# Copy any other missing fields from OCR attempt
-								for key in ocr_fields:
-									if not fields.get(key, "").strip():
-										fields[key] = ocr_fields[key]
-				except Exception as e:
-					LOGGER.debug("OCR fallback failed for page %d: %s", page_num, e)
+				# If invoice number is still blank, try OCR fallback on the page
+				if not current_inv and len(page_text.strip()) > 20:
+					try:
+						# Apply OCR to this specific page as fallback.
+						image = render_pdf_page_image(pdf_bytes, page_num, dpi=300)
+						if image is not None:
+							ocr_text = ocr_image(image, prefer_google=True)
+							if len(ocr_text.strip()) > 20:
+								ocr_fields = extract_fields(ocr_text, is_axis_bank=is_axis)
+								ocr_inv = (ocr_fields.get("Vendor Inv No", "") or "").strip()
+								if ocr_inv and is_valid_invoice_no(ocr_inv):
+									fields["Vendor Inv No"] = ocr_inv
+									# Copy any other missing fields from OCR attempt
+									for key in ocr_fields:
+										if not fields.get(key, "").strip():
+											fields[key] = ocr_fields[key]
+						else:
+							LOGGER.debug("OCR fallback produced no usable image for page %d", page_num)
+					except Exception as e:
+						LOGGER.debug("OCR fallback failed for page %d: %s", page_num, e)
 			
-			if from_name and has_receipt_signal:
-				if not is_valid_invoice_no(current_inv):
-					fields["Vendor Inv No"] = from_name
-				elif from_name.isdigit() and 3 <= len(from_name) <= 6:
-					# For files explicitly named as Invoice No <n>, prefer the filename token.
-					if (not current_inv.isdigit()) or current_inv != from_name:
+				if from_name and has_receipt_signal:
+					if not is_valid_invoice_no(current_inv):
 						fields["Vendor Inv No"] = from_name
+					elif from_name.isdigit() and 3 <= len(from_name) <= 6:
+						# For files explicitly named as Invoice No <n>, prefer the filename token.
+						if (not current_inv.isdigit()) or current_inv != from_name:
+							fields["Vendor Inv No"] = from_name
 
-			# Do not create a row for page/chunk text that is not an actual receipt.
-			if not is_actual_receipt_row(fields, receipt_text):
-				continue
-			page_rows.append(fields)
+				# Continuation-page rescue: if current chunk has monetary breakup but no invoice,
+				# inherit invoice identity only when amounts match the latest invoice row.
+				current_inv = (fields.get("Vendor Inv No", "") or "").strip()
+				continuation_has_amount = any(
+					bool(clean_amount(fields.get(k, "")))
+					for k in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]
+				)
+				if (not is_valid_invoice_no(current_inv)) and last_invoice_no and continuation_has_amount and _same_line_item_by_amount(fields, last_invoice_basis):
+					fields["Vendor Inv No"] = last_invoice_no
+					for col in [
+						"Vendor Inv Date",
+						"Agent Name",
+						"Agent PAN",
+						"Name of Service Receipient",
+						"BALIC STATE",
+						"BALIC GSTN",
+						"BROKER GSTN STATE",
+						"BROKER GSTN",
+						"Narration",
+						"DATE_FROM",
+						"DATE_TO",
+						"AGENT_CODE",
+					]:
+						if not (fields.get(col, "") or "").strip() and (last_identity_fields.get(col, "") or "").strip():
+							fields[col] = last_identity_fields[col]
+
+				# Do not create a row for page/chunk text that is not an actual receipt.
+				if not is_actual_receipt_row(fields, receipt_text):
+					continue
+				matched_existing = None
+				if (fields.get("Vendor Inv No", "") or "").strip():
+					for existing in page_rows:
+						if (existing.get("Vendor Inv No", "") or "").strip() == (fields.get("Vendor Inv No", "") or "").strip():
+							matched_existing = existing
+							break
+				if matched_existing is not None:
+					for col in OUTPUT_COLUMNS:
+						if not (matched_existing.get(col, "") or "").strip() and (fields.get(col, "") or "").strip():
+							matched_existing[col] = fields[col]
+				else:
+					page_rows.append(fields)
+				inv_added = (fields.get("Vendor Inv No", "") or "").strip()
+				if is_valid_invoice_no(inv_added):
+					last_invoice_no = inv_added
+					last_invoice_basis = dict(fields)
+					for col in [
+						"Vendor Inv Date",
+						"Agent Name",
+						"Agent PAN",
+						"Name of Service Receipient",
+						"BALIC STATE",
+						"BALIC GSTN",
+						"BROKER GSTN STATE",
+						"BROKER GSTN",
+						"Narration",
+						"DATE_FROM",
+						"DATE_TO",
+						"AGENT_CODE",
+					]:
+						last_identity_fields[col] = (fields.get(col, "") or "").strip()
+
+		gst_mode_conflict_trigger = any(_looks_gst_mode_ambiguous(r) for r in page_rows)
 
 		# Low-cost AI fallback: call Azure mini only when deterministic extraction is weak.
+		improbable_trigger = any(_looks_mapping_improbable(r) for r in page_rows)
+		identity_conflict_trigger = any(_has_gstin_role_conflict(r) for r in page_rows)
+		high_value_trigger = any(_is_high_value_row(r) for r in page_rows)
 		should_try_ai = bool(get_azure_openai_config()) and (
+			low_conf_page
+			or
 			not page_rows
 			or any(_looks_mapping_incomplete(r) for r in page_rows)
-			or any(_looks_mapping_improbable(r) for r in page_rows)
+			or improbable_trigger
+			or identity_conflict_trigger
+			or gst_mode_conflict_trigger
+			or high_value_trigger
 		)
+		if ai_first:
+			should_try_ai = False
 		if should_try_ai:
 			LOGGER.info("Running Azure mini extraction for %s page %s", effective_display, page_num)
-			ai_rows = extract_receipts_with_azure_llm(page_text, effective_display, page_num)
+			ai_rows = extract_receipts_with_azure_llm(page_text, effective_display, page_num, _gst_mode_context_hint(page_rows) if gst_mode_conflict_trigger else "")
 			LOGGER.info("Azure mini returned %s receipt candidate(s) for %s page %s", len(ai_rows), effective_display, page_num)
 			for ai_row in ai_rows:
 				ai_row = merge_page_fallback_fields(ai_row, page_fields)
-				ai_row = apply_party_overrides(ai_row, effective_source, f"{effective_display} {page_text}")
-				ai_row = backfill_agent_pan(ai_row, f"{effective_display} {page_text}")
-				ai_row = normalize_mapping_anomalies(ai_row, f"{effective_display} {page_text}", effective_source)
+				ai_row = apply_party_overrides(ai_row, effective_source, page_text)
+				ai_row = backfill_agent_pan(ai_row, page_text)
+				ai_row = normalize_mapping_anomalies(ai_row, page_text, effective_source)
+				ai_row = enforce_tax_mode_fields(ai_row)
+				ai_inv = (ai_row.get("Vendor Inv No", "") or "").strip()
+				ai_has_amount = any(
+					bool(clean_amount(ai_row.get(k, "")))
+					for k in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]
+				)
+				if (not is_valid_invoice_no(ai_inv)) and last_invoice_no and ai_has_amount and _same_line_item_by_amount(ai_row, last_invoice_basis):
+					ai_row["Vendor Inv No"] = last_invoice_no
+					for col in [
+						"Vendor Inv Date",
+						"Agent Name",
+						"Agent PAN",
+						"Name of Service Receipient",
+						"BALIC STATE",
+						"BALIC GSTN",
+						"BROKER GSTN STATE",
+						"BROKER GSTN",
+						"Narration",
+						"DATE_FROM",
+						"DATE_TO",
+						"AGENT_CODE",
+					]:
+						if not (ai_row.get(col, "") or "").strip() and (last_identity_fields.get(col, "") or "").strip():
+							ai_row[col] = last_identity_fields[col]
 				if not is_actual_receipt_row(ai_row, page_text):
 					continue
 
@@ -4406,13 +6739,66 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
 							matched = existing
 							break
 				if matched is not None:
+					reconciled = _reconcile_regex_ai_monetary(matched, ai_row)
+					for mcol in ["BROKERAGE Amount", "Total Inv Amt", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "UTGST", "IGST"]:
+						if (reconciled.get(mcol, "") or "").strip():
+							matched[mcol] = reconciled[mcol]
+
+					force_replace_identity_cols = {
+						"BROKER GSTN",
+						"BROKER GSTN STATE",
+						"Agent PAN",
+					}
+					tax_mode_cols = {"CGST @ 9%", "SGST @ 9%", "UTGST", "IGST"}
+					allow_identity_override = _should_ai_override_identity(matched, ai_row)
+					matched_mode = _detect_clear_tax_mode(matched)
+					ai_mode = _detect_clear_tax_mode(ai_row)
 					for col in OUTPUT_COLUMNS:
-						if not (matched.get(col, "") or "").strip() and (ai_row.get(col, "") or "").strip():
+						if allow_identity_override and col in force_replace_identity_cols and (ai_row.get(col, "") or "").strip():
+							matched[col] = ai_row[col]
+						elif col in tax_mode_cols and matched_mode in {"igst", "state"} and ai_mode in {"igst", "state"} and ai_mode != matched_mode:
+							continue
+						elif not (matched.get(col, "") or "").strip() and (ai_row.get(col, "") or "").strip():
 							matched[col] = ai_row[col]
 				else:
 					page_rows.append(ai_row)
+				inv_added = (ai_row.get("Vendor Inv No", "") or "").strip()
+				if is_valid_invoice_no(inv_added):
+					last_invoice_no = inv_added
+					last_invoice_basis = dict(ai_row)
+					for col in [
+						"Vendor Inv Date",
+						"Agent Name",
+						"Agent PAN",
+						"Name of Service Receipient",
+						"BALIC STATE",
+						"BALIC GSTN",
+						"BROKER GSTN STATE",
+						"BROKER GSTN",
+						"Narration",
+						"DATE_FROM",
+						"DATE_TO",
+						"AGENT_CODE",
+					]:
+						last_identity_fields[col] = (ai_row.get(col, "") or "").strip()
+
+		if is_bajaj_finance_file:
+			bajaj_total_rows = [r for r in page_rows if _is_bajaj_finance_total_row(page_text, r)]
+			if bajaj_total_rows:
+				best_bajaj_row = max(bajaj_total_rows, key=lambda r: (_monetary_signal_score(r), len([v for v in r.values() if str(v).strip()])))
+				page_rows = [best_bajaj_row]
+			elif page_rows:
+				page_rows = [max(page_rows, key=lambda r: (_monetary_signal_score(r), len([v for v in r.values() if str(v).strip()]))) ]
+			else:
+				continue
 
 		for fields in page_rows:
+			fields = apply_confident_math_fill(fields)
+			fields = enforce_tax_mode_fields(fields)
+			fields = apply_gst_autofill(fields)
+			if not (fields.get("Narration", "") or "").strip():
+				inferred_narr = infer_narration_from_source_name(effective_display)
+				fields["Narration"] = inferred_narr if inferred_narr else "COMMISSION"
 			# Validate mathematical calculations and flag mismatches
 			is_math_valid, math_reason = validate_math_extraction(fields)
 			fields["Math Valid"] = "YES" if is_math_valid else f"NO: {math_reason}"
@@ -4450,15 +6836,25 @@ def process_image(path: Path, source_hint: Optional[Path] = None, source_display
 	rows: List[ReceiptLineItem] = []
 	effective_source = source_hint or path
 	effective_display = source_display or str(path)
+	is_bajaj_finance_file = _is_bajaj_finance_context(effective_display)
 	for page_num, text in extract_text_from_image_file(path):
 		fields = extract_fields(text)
-		fields = apply_party_overrides(fields, effective_source, f"{effective_display} {text}")
-		fields = backfill_agent_pan(fields, f"{effective_display} {text}")
+		fields = apply_party_overrides(fields, effective_source, text)
+		fields = backfill_agent_pan(fields, text)
 		if (fields.get("Narration", "") or "").strip().upper() == "COMMISSION":
 			inferred_narr = infer_narration_from_source_name(effective_display)
 			if inferred_narr:
 				fields["Narration"] = inferred_narr
-		fields = normalize_mapping_anomalies(fields, f"{effective_display} {text}", effective_source)
+		fields = normalize_mapping_anomalies(fields, text, effective_source)
+		fields = enforce_tax_mode_fields(fields)
+		fields = apply_gst_autofill(fields)
+		if is_bajaj_finance_file and not _is_bajaj_finance_total_row(text, fields):
+			continue
+		if is_bajaj_finance_file and _is_bajaj_finance_row(fields) and _amount_to_float(fields.get("Total Inv Amt", "")) <= 0:
+			continue
+		if not (fields.get("Narration", "") or "").strip():
+			inferred_narr = infer_narration_from_source_name(effective_display)
+			fields["Narration"] = inferred_narr if inferred_narr else "COMMISSION"
 		
 		# Validate mathematical calculations and flag mismatches
 		is_math_valid, math_reason = validate_math_extraction(fields)
@@ -4477,6 +6873,8 @@ def process_path(path: Path, override_password: Optional[str], source_hint: Opti
 		return process_pdf(path, override_password, source_hint=source_hint, source_display=source_display)
 	if suffix in {".jpg", ".jpeg", ".png"}:
 		return process_image(path, source_hint=source_hint, source_display=source_display)
+	if suffix in {".xlsx", ".xlsm", ".xlsb", ".xls"}:
+		return process_spreadsheet(path, source_hint=source_hint, source_display=source_display)
 	if suffix == ".zip":
 		all_rows: List[ReceiptLineItem] = []
 		extracted_root = extract_zip_to_temp(path)
@@ -4504,10 +6902,183 @@ def rows_to_dataframe(rows: List[ReceiptLineItem]) -> pd.DataFrame:
 		if column not in df.columns:
 			df[column] = ""
 
+	# Merge continuation rows split across pages in the same source file.
+	# Typical pattern: page 1 has invoice identity, page 2 has monetary breakup.
+	if not df.empty:
+		# Reconciliation pass: derive missing monetary fields from coherent components.
+		for idx in df.index:
+			row_dict = {col: ("" if pd.isna(df.at[idx, col]) else str(df.at[idx, col])) for col in OUTPUT_COLUMNS if col in df.columns}
+			row_dict = enforce_tax_mode_fields(row_dict)
+			row_dict = _maybe_correct_brokerage_from_total_and_tax(row_dict)
+			row_dict = enforce_tax_mode_fields(row_dict)
+			row_dict = _maybe_fix_ujjivan_gst_total(row_dict)
+			row_dict = enforce_tax_mode_fields(row_dict)
+			row_dict = _maybe_fix_city_union_gst_total(row_dict)
+			row_dict = enforce_tax_mode_fields(row_dict)
+			row_dict = _maybe_fix_dhanlaxmi_tax_components(row_dict)
+			row_dict = enforce_tax_mode_fields(row_dict)
+			row_dict = apply_confident_math_fill(row_dict)
+			row_dict = enforce_tax_mode_fields(row_dict)
+			row_dict = apply_gst_autofill(row_dict)
+			brok = _amount_to_float(row_dict.get("BROKERAGE Amount", ""))
+			igst = _amount_to_float(row_dict.get("IGST", ""))
+			cgst = _amount_to_float(row_dict.get("CGST @ 9%", ""))
+			sgst = _amount_to_float(row_dict.get("SGST @ 9%", ""))
+			utgst = _amount_to_float(row_dict.get("UTGST", ""))
+			gst_total = _amount_to_float(row_dict.get("GST TOTAL AMT", ""))
+			total = _amount_to_float(row_dict.get("Total Inv Amt", ""))
+			tax_component = igst if igst > 0 else (cgst + max(sgst, utgst))
+			if gst_total <= 0 and tax_component > 0:
+				row_dict["GST TOTAL AMT"] = f"{tax_component:.2f}".rstrip("0").rstrip(".")
+				gst_total = tax_component
+			if total <= 0 and brok > 0 and gst_total > 0:
+				row_dict["Total Inv Amt"] = f"{(brok + gst_total):.2f}".rstrip("0").rstrip(".")
+			if brok <= 0 and total > 0 and gst_total > 0 and total > gst_total:
+				row_dict["BROKERAGE Amount"] = f"{(total - gst_total):.2f}".rstrip("0").rstrip(".")
+			for col in ["BROKERAGE Amount", "CGST @ 9%", "SGST @ 9%", "UTGST", "IGST", "GST TOTAL AMT", "Total Inv Amt"]:
+				if col in df.columns:
+					df.at[idx, col] = row_dict.get(col, "")
+		df["_src_file"] = df["Source File"].fillna("").astype(str).str.strip()
+		df["_src_page_num"] = pd.to_numeric(df["Source Page"], errors="coerce").fillna(0).astype(int)
+		df["_inv"] = df["Vendor Inv No"].fillna("").astype(str).str.strip()
+		total_num = pd.to_numeric(df["Total Inv Amt"], errors="coerce")
+		brok_num = pd.to_numeric(df["BROKERAGE Amount"], errors="coerce")
+		gst_num = pd.to_numeric(df["GST TOTAL AMT"], errors="coerce")
+		cgst_num = pd.to_numeric(df["CGST @ 9%"], errors="coerce").fillna(0.0)
+		sgst_num = pd.to_numeric(df["SGST @ 9%"], errors="coerce").fillna(0.0)
+		utgst_num = pd.to_numeric(df["UTGST"], errors="coerce").fillna(0.0)
+		igst_num = pd.to_numeric(df["IGST"], errors="coerce").fillna(0.0)
+		tax_num = gst_num.fillna(0.0) + cgst_num + sgst_num + utgst_num + igst_num
+		weak_identity_row = df["_inv"].ne("") & (brok_num.fillna(0.0) <= 0.0) & (tax_num <= 0.0)
+		strong_monetary_row = df["_inv"].eq("") & (brok_num.fillna(0.0) > 0.0) & (tax_num > 0.0)
+
+		drop_idx: Set[int] = set()
+		for src_file, src_group in df.groupby("_src_file", sort=False):
+			if not src_file:
+				continue
+			group_idx = src_group.index.tolist()
+			inv_idxs = [i for i in group_idx if bool(weak_identity_row.get(i, False))]
+			monetary_idxs = [i for i in group_idx if bool(strong_monetary_row.get(i, False))]
+			for inv_idx in inv_idxs:
+				inv_total = total_num.get(inv_idx)
+				best_idx = None
+				best_score = -1.0
+				for cand_idx in monetary_idxs:
+					if cand_idx in drop_idx:
+						continue
+					cand_total = total_num.get(cand_idx)
+					if pd.notna(inv_total) and pd.notna(cand_total) and abs(float(inv_total) - float(cand_total)) > 1.0:
+						continue
+					score = float(brok_num.get(cand_idx) or 0.0) + float(tax_num.get(cand_idx) or 0.0)
+					if score > best_score:
+						best_score = score
+						best_idx = cand_idx
+				if best_idx is None:
+					continue
+
+				# Keep stronger monetary row, backfill identity from page 1 row.
+				for col in [
+					"Vendor Inv No",
+					"Vendor Inv Date",
+					"Agent Name",
+					"Agent PAN",
+					"BALIC GSTN",
+					"BALIC STATE",
+					"BROKER GSTN",
+					"BROKER GSTN STATE",
+					"Name of Service Receipient",
+					"Narration",
+					"DATE_FROM",
+					"DATE_TO",
+					"AGENT_CODE",
+				]:
+					if not str(df.at[best_idx, col]).strip() and str(df.at[inv_idx, col]).strip():
+						df.at[best_idx, col] = df.at[inv_idx, col]
+
+				# Recompute row quality markers after merge.
+				merged = {col: str(df.at[best_idx, col]) if col in df.columns else "" for col in OUTPUT_COLUMNS}
+				is_math_valid, math_reason = validate_math_extraction(merged)
+				df.at[best_idx, "Math Valid"] = "YES" if is_math_valid else f"NO: {math_reason}"
+				df.at[best_idx, "Missing Field and Why"] = build_missing_field_reason(merged)
+
+				drop_idx.add(inv_idx)
+
+		if drop_idx:
+			df = df.drop(index=list(drop_idx)).copy()
+
+		# Remove weak non-invoice rows when a stronger same-total row exists in the same file.
+		# This handles split-page cases where page 1 carries partial header values and page 2 has full details.
+		total_num2 = pd.to_numeric(df["Total Inv Amt"], errors="coerce")
+		brok_num2 = pd.to_numeric(df["BROKERAGE Amount"], errors="coerce")
+		gst_num2 = pd.to_numeric(df["GST TOTAL AMT"], errors="coerce")
+		inv_present2 = df["Vendor Inv No"].fillna("").astype(str).str.strip().ne("")
+		drop_weak_idx: Set[int] = set()
+		for src_file, src_group in df.groupby("_src_file", sort=False):
+			if not src_file:
+				continue
+			idxs = src_group.index.tolist()
+			def _num_or_zero(series: pd.Series, idx: int) -> float:
+				val = series.get(idx)
+				if pd.isna(val):
+					return 0.0
+				try:
+					return float(val)
+				except (TypeError, ValueError):
+					return 0.0
+			strong_idxs = [
+				i for i in idxs
+				if (inv_present2.get(i, False) or (_num_or_zero(brok_num2, i) > 0 and _num_or_zero(gst_num2, i) > 0))
+			]
+			weak_idxs = [
+				i for i in idxs
+				if (not inv_present2.get(i, False)) and (_num_or_zero(brok_num2, i) <= 0 or _num_or_zero(gst_num2, i) <= 0)
+			]
+			for weak_idx in weak_idxs:
+				weak_total = total_num2.get(weak_idx)
+				if pd.isna(weak_total) or float(weak_total) <= 0:
+					continue
+				weak_page = int(df.at[weak_idx, "_src_page_num"]) if "_src_page_num" in df.columns else 0
+				for strong_idx in strong_idxs:
+					if strong_idx == weak_idx:
+						continue
+					strong_total = total_num2.get(strong_idx)
+					if pd.isna(strong_total):
+						continue
+					if abs(float(weak_total) - float(strong_total)) > 1.0:
+						continue
+					strong_page = int(df.at[strong_idx, "_src_page_num"]) if "_src_page_num" in df.columns else 0
+					if strong_page >= weak_page:
+						drop_weak_idx.add(weak_idx)
+						break
+
+		if drop_weak_idx:
+			df = df.drop(index=list(drop_weak_idx)).copy()
+
+		df = df.drop(columns=["_src_file", "_src_page_num", "_inv"])
+
+	# Drop non-invoice placeholder rows that contain no extractable data.
+	# These are support files/certificates/decrypt failures and inflate blanks/math failures.
+	if not df.empty:
+		reason = df["Missing Field and Why"].fillna("").astype(str)
+		is_placeholder_reason = reason.str.contains(
+			r"No identifiable receipt data extracted from document|Extraction failed: Unable to decrypt PDF",
+			case=False,
+			regex=True,
+		)
+		has_core_values = (
+			df["Vendor Inv No"].fillna("").astype(str).str.strip().ne("")
+			| df["Vendor Inv Date"].fillna("").astype(str).str.strip().ne("")
+			| df["Total Inv Amt"].fillna("").astype(str).str.strip().ne("")
+			| df["BROKERAGE Amount"].fillna("").astype(str).str.strip().ne("")
+			| df["BALIC GSTN"].fillna("").astype(str).str.strip().ne("")
+			| df["BROKER GSTN"].fillna("").astype(str).str.strip().ne("")
+		)
+		df = df.loc[~(is_placeholder_reason & ~has_core_values)].copy()
 	# Collapse split artifacts where duplicate rows differ only by an empty Total Inv Amt.
 	df["_source_file"] = df["Source File"].fillna("").astype(str).str.strip()
 	df["_source_page"] = df["Source Page"].fillna("").astype(str).str.strip()
 	df["_vendor_inv"] = df["Vendor Inv No"].fillna("").astype(str).str.strip()
+	df["_vendor_date"] = df["Vendor Inv Date"].fillna("").astype(str).str.strip()
 	df["_brok"] = df["BROKERAGE Amount"].fillna("").astype(str).str.strip()
 	df["_gst"] = df["GST TOTAL AMT"].fillna("").astype(str).str.strip()
 	df["_cgst"] = df["CGST @ 9%"].fillna("").astype(str).str.strip()
@@ -4528,19 +7099,17 @@ def rows_to_dataframe(rows: List[ReceiptLineItem]) -> pd.DataFrame:
 	expected_total_num = brok_num + gst_component_num
 	has_basis = brok_num.notna() & total_num.notna() & (gst_component_num > 0)
 	df["_total_consistency_error"] = (total_num - expected_total_num).abs()
+	# Penalize rows with missing GST components (tax, cgst, sgst, igst all empty)
+	has_gst_component = (df["_cgst"].ne("") | df["_sgst"].ne("") | df["_igst"].ne(""))
+	df.loc[~has_gst_component, "_total_consistency_error"] = 10**12
 	df.loc[~has_basis, "_total_consistency_error"] = 10**12
 
 	df = df.sort_values(["_total_present", "_total_consistency_error"], ascending=[False, True])
 	df = df.drop_duplicates(
 		subset=[
 			"_source_file",
-			"_source_page",
 			"_vendor_inv",
-			"_brok",
-			"_gst",
-			"_cgst",
-			"_sgst",
-			"_igst",
+			"_vendor_date",
 		],
 		keep="first",
 	)
@@ -4548,6 +7117,7 @@ def rows_to_dataframe(rows: List[ReceiptLineItem]) -> pd.DataFrame:
 		"_source_file",
 		"_source_page",
 		"_vendor_inv",
+		"_vendor_date",
 		"_brok",
 		"_gst",
 		"_cgst",
@@ -4566,25 +7136,41 @@ def rows_to_dataframe(rows: List[ReceiptLineItem]) -> pd.DataFrame:
 		lambda row: sum(1 for v in row if str(v).strip()), axis=1
 	)
 	
-	# Keep multiple actual receipts on the same page distinct.
-	# Include invoice/date/amount tuple in key so City Union multi-receipt pages are preserved.
+	# Primary dedup key: source file + invoice number.
+	# If invoice is missing, preserve distinct line items via page+monetary signature.
+	vendor_inv_norm = df["Vendor Inv No"].astype(str).fillna("").str.strip()
+	missing_inv_mask = vendor_inv_norm.eq("")
+	fallback_sig = (
+		df["Source Page"].astype(str).fillna("").str.strip()
+		+ "|"
+		+ df["Total Inv Amt"].astype(str).fillna("").str.strip()
+		+ "|"
+		+ df["BROKERAGE Amount"].astype(str).fillna("").str.strip()
+		+ "|"
+		+ df["GST TOTAL AMT"].astype(str).fillna("").str.strip()
+		+ "|"
+		+ df["CGST @ 9%"].astype(str).fillna("").str.strip()
+		+ "|"
+		+ df["SGST @ 9%"].astype(str).fillna("").str.strip()
+		+ "|"
+		+ df["IGST"].astype(str).fillna("").str.strip()
+	)
 	df["_dedup_key"] = (
-		df["Source File"].astype(str).fillna("")
+		df["Source File"].astype(str).fillna("").str.strip()
 		+ "|"
-		+ df["Source Page"].astype(str).fillna("")
+		+ vendor_inv_norm.where(~missing_inv_mask, "NOINV|" + fallback_sig)
 		+ "|"
-		+ df["Vendor Inv No"].astype(str).fillna("")
-		+ "|"
-		+ df["Vendor Inv Date"].astype(str).fillna("")
-		+ "|"
-		+ df["Total Inv Amt"].astype(str).fillna("")
-		+ "|"
-		+ df["BROKERAGE Amount"].astype(str).fillna("")
-		+ "|"
-		+ df["GST TOTAL AMT"].astype(str).fillna("")
+		+ df["Vendor Inv Date"].astype(str).fillna("").str.strip()
 	)
 
 	df = df.sort_values("_fill_score", ascending=False).drop_duplicates(subset=["_dedup_key"], keep="first")
+	# Collapse exact duplicate receipts across different source files by business content.
+	content_cols = [c for c in OUTPUT_COLUMNS if c not in {"Source File", "Source Page", "Math Valid", "Missing Field and Why"}]
+	df["_content_key"] = df[content_cols].fillna("").astype(str).apply(
+		lambda row: "|".join(_normalized_key_cell(value) for value in row),
+		axis=1,
+	)
+	df = df.sort_values("_fill_score", ascending=False).drop_duplicates(subset=["_content_key"], keep="first")
 	# Keep output ordered for review: same source file together, same agent together,
 	# and page-wise ascending.
 	df["_source_page_num"] = pd.to_numeric(df["Source Page"], errors="coerce").fillna(0).astype(int)
@@ -4593,18 +7179,179 @@ def rows_to_dataframe(rows: List[ReceiptLineItem]) -> pd.DataFrame:
 		ascending=[True, True, True, True],
 		kind="mergesort",
 	)
-	df = df.drop(columns=["_fill_score", "_dedup_key"])
+	df = df.drop(columns=["_fill_score", "_dedup_key", "_content_key"])
 	if "_source_page_num" in df.columns:
 		df = df.drop(columns=["_source_page_num"])
+
+	# Final pass: always recompute quality flags after all monetary/tax reconciliation.
+	if not df.empty:
+		for idx in df.index:
+			row_dict = {col: ("" if pd.isna(df.at[idx, col]) else str(df.at[idx, col])) for col in OUTPUT_COLUMNS if col in df.columns}
+			is_math_valid, math_reason = validate_math_extraction(row_dict)
+			df.at[idx, "Math Valid"] = "YES" if is_math_valid else f"NO: {math_reason}"
+			df.at[idx, "Missing Field and Why"] = build_missing_field_reason(row_dict)
 	return df[OUTPUT_COLUMNS]
 
 
-def run(input_path: Path, output_file: Path, password: Optional[str] = None) -> Path:
+def _normalized_key_cell(value: object) -> str:
+	if value is None or (isinstance(value, float) and pd.isna(value)):
+		return ""
+	return str(value).strip().lower()
+
+
+def _build_reconciliation_keys(df: pd.DataFrame, key_columns: Sequence[str]) -> pd.Series:
+	if df.empty:
+		return pd.Series(dtype="string")
+
+	def join_key(row: pd.Series) -> str:
+		return "|".join(_normalized_key_cell(row.get(col, "")) for col in key_columns)
+
+	return df.apply(join_key, axis=1)
+
+
+def write_audit_report(
+	output_file: Path,
+	df: pd.DataFrame,
+	processed_sources: Sequence[str],
+	baseline_output: Optional[Path] = None,
+	audit_output: Optional[Path] = None,
+) -> Optional[Path]:
+	"""Write a non-blocking audit workbook for coverage and optional baseline reconciliation."""
+	try:
+		if audit_output is None:
+			audit_output = output_file.with_name(f"{output_file.stem}_audit.xlsx")
+
+		source_counts = (
+			df.groupby("Source File", dropna=False)
+			.size()
+			.rename("rows_in_output")
+			.reset_index()
+			.rename(columns={"Source File": "source_file"})
+		)
+		source_counts["source_file"] = source_counts["source_file"].fillna("").astype(str)
+
+		expected_df = pd.DataFrame({"source_file": [str(s) for s in processed_sources]})
+		if not expected_df.empty:
+			expected_df = expected_df.drop_duplicates(subset=["source_file"], keep="first")
+
+		coverage = expected_df.merge(source_counts, on="source_file", how="left")
+		if "rows_in_output" not in coverage.columns:
+			coverage["rows_in_output"] = 0
+		coverage["rows_in_output"] = coverage["rows_in_output"].fillna(0).astype(int)
+		coverage["status"] = np.where(coverage["rows_in_output"] > 0, "HAS_ROWS", "NO_ROWS")
+
+		summary_rows = [
+			{"metric": "processed_sources", "value": int(len(expected_df))},
+			{"metric": "sources_with_rows", "value": int((coverage["rows_in_output"] > 0).sum())},
+			{"metric": "sources_with_no_rows", "value": int((coverage["rows_in_output"] == 0).sum())},
+			{"metric": "output_rows", "value": int(len(df))},
+		]
+
+		with pd.ExcelWriter(audit_output, engine="openpyxl") as writer:
+			pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="coverage_summary")
+			coverage.sort_values(["status", "source_file"], ascending=[True, True]).to_excel(
+				writer,
+				index=False,
+				sheet_name="source_coverage",
+			)
+			coverage.loc[coverage["rows_in_output"] == 0].sort_values("source_file").to_excel(
+				writer,
+				index=False,
+				sheet_name="sources_with_no_rows",
+			)
+
+			if baseline_output and baseline_output.exists():
+				baseline_df = pd.read_excel(baseline_output)
+				for col in OUTPUT_COLUMNS:
+					if col not in baseline_df.columns:
+						baseline_df[col] = ""
+
+				key_cols = ["Vendor Inv No", "Vendor Inv Date", "Total Inv Amt"]
+				current_keyed = df.copy()
+				baseline_keyed = baseline_df.copy()
+				current_keyed["_recon_key"] = _build_reconciliation_keys(current_keyed, key_cols)
+				baseline_keyed["_recon_key"] = _build_reconciliation_keys(baseline_keyed, key_cols)
+
+				current_keys = set(current_keyed["_recon_key"].tolist())
+				baseline_keys = set(baseline_keyed["_recon_key"].tolist())
+
+				missing_keys = sorted(list(baseline_keys - current_keys))
+				added_keys = sorted(list(current_keys - baseline_keys))
+
+				missing_df = baseline_keyed[baseline_keyed["_recon_key"].isin(missing_keys)].copy()
+				added_df = current_keyed[current_keyed["_recon_key"].isin(added_keys)].copy()
+				missing_df = missing_df.drop(columns=["_recon_key"], errors="ignore")
+				added_df = added_df.drop(columns=["_recon_key"], errors="ignore")
+
+				recon_summary = pd.DataFrame(
+					[
+						{"metric": "baseline_rows", "value": int(len(baseline_df))},
+						{"metric": "current_rows", "value": int(len(df))},
+						{"metric": "baseline_unique_keys", "value": int(len(baseline_keys))},
+						{"metric": "current_unique_keys", "value": int(len(current_keys))},
+						{"metric": "missing_in_current", "value": int(len(missing_keys))},
+						{"metric": "added_in_current", "value": int(len(added_keys))},
+					],
+				)
+				recon_summary.to_excel(writer, index=False, sheet_name="reconciliation_summary")
+				missing_df.to_excel(writer, index=False, sheet_name="missing_in_current")
+				added_df.to_excel(writer, index=False, sheet_name="added_in_current")
+
+		LOGGER.info("Wrote audit report to %s", audit_output)
+		return audit_output
+	except Exception as exc:  # pragma: no cover
+		LOGGER.warning("Failed to write audit report: %s", exc)
+		return None
+
+
+def apply_agent_code_mapping_to_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+	"""Apply agent code mapping to all rows in the dataframe.
+	
+	For each row:
+	- If AGENT_CODE is empty, try to find it via agent name similarity matching
+	- Update Agent Name to the clean name from the mapping if a match is found
+	"""
+	if df.empty or "Agent Name" not in df.columns or "AGENT_CODE" not in df.columns:
+		return df
+	
+	df = df.copy()
+	
+	for idx, row in df.iterrows():
+		# Handle potential NaN values by converting to string first, then stripping
+		agent_name_raw = row["Agent Name"]
+		agent_name = (str(agent_name_raw) if pd.notna(agent_name_raw) else "").strip()
+		
+		agent_code_raw = row["AGENT_CODE"]
+		agent_code = (str(agent_code_raw) if pd.notna(agent_code_raw) else "").strip()
+		
+		# Only process if code is missing but name is present
+		if not agent_code and agent_name and agent_name != "nan":
+			matched_code, clean_name, similarity = find_best_matching_agent_code(agent_name)
+			if matched_code:
+				df.at[idx, "AGENT_CODE"] = matched_code
+				df.at[idx, "Agent Name"] = clean_name
+				LOGGER.debug("Final mapping: '%s' -> code %s (similarity: %.2f)", agent_name, matched_code, similarity)
+	
+	return df
+
+
+def run(
+	input_path: Path,
+	output_file: Path,
+	password: Optional[str] = None,
+	baseline_output: Optional[Path] = None,
+	audit_output: Optional[Path] = None,
+) -> Path:
 	if not input_path.exists():
 		raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
+	# Load agent code mappings from agentcode.xlsx
+	load_agent_codes_from_xlsx()
+
 	all_rows: List[ReceiptLineItem] = []
+	processed_sources: List[str] = []
 	for file_path in find_candidate_files(input_path):
+		processed_sources.append(str(file_path))
 		LOGGER.info("Processing: %s", file_path)
 		try:
 			rows = process_path(file_path, password)
@@ -4617,8 +7364,20 @@ def run(input_path: Path, output_file: Path, password: Optional[str] = None) -> 
 			all_rows.append(build_placeholder_row(str(file_path), "", f"Extraction failed: {exc}"))
 
 	df = rows_to_dataframe(all_rows)
+	
+	# Post-processing: Apply final agent code mapping to dataframe
+	if not df.empty and AGENT_CODE_BY_NAME:
+		df = apply_agent_code_mapping_to_dataframe(df)
+	
 	output_file.parent.mkdir(parents=True, exist_ok=True)
 	df.to_excel(output_file, index=False)
+	write_audit_report(
+		output_file=output_file,
+		df=df,
+		processed_sources=processed_sources,
+		baseline_output=baseline_output,
+		audit_output=audit_output,
+	)
 	LOGGER.info("Wrote %s rows to %s", len(df), output_file)
 	LOGGER.info(
 		"Usage summary | google_vision_calls=%s | azure_ai_calls=%s | azure_ai_input_chars=%s | azure_ai_output_chars=%s",
@@ -4632,7 +7391,7 @@ def run(input_path: Path, output_file: Path, password: Optional[str] = None) -> 
 
 def build_arg_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
-		description="Extract receipt data from PDF/JPG/ZIP and write normalized Excel output.",
+		description="Extract receipt data from PDF/JPG/ZIP/Excel and write normalized Excel output.",
 	)
 	parser.add_argument("--input", required=True, help="Input file or folder path")
 	parser.add_argument("--output", required=True, help="Output Excel file path (.xlsx)")
@@ -4647,6 +7406,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 		action="store_true",
 		help="Enable verbose logs",
 	)
+	parser.add_argument(
+		"--baseline-output",
+		required=False,
+		default=None,
+		help="Optional previous output Excel file for non-blocking reconciliation",
+	)
+	parser.add_argument(
+		"--audit-output",
+		required=False,
+		default=None,
+		help="Optional audit report Excel file path; defaults to <output>_audit.xlsx",
+	)
 	return parser
 
 
@@ -4654,7 +7425,13 @@ def main() -> None:
 	parser = build_arg_parser()
 	args = parser.parse_args()
 	configure_logging(args.verbose)
-	run(Path(args.input), Path(args.output), args.password)
+	run(
+		Path(args.input),
+		Path(args.output),
+		args.password,
+		Path(args.baseline_output) if args.baseline_output else None,
+		Path(args.audit_output) if args.audit_output else None,
+	)
 
 
 if __name__ == "__main__":
