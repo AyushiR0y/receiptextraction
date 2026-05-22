@@ -69,13 +69,13 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
     box-shadow: 0 4px 12px rgba(0,94,172,0.28);
 }}
 .topbar-title {{
-    font-size: 1.15rem;
+    font-size: 1.55rem;
     font-weight: 700;
     color: {TEXT};
     letter-spacing: -0.02em;
 }}
 .topbar-sub {{
-    font-size: 0.82rem;
+    font-size: 0.95rem;
     color: {TEXT_MUTED};
     font-weight: 400;
 }}
@@ -113,17 +113,19 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
 
 /* ── Card ── */
 .card {{
-    background: {SURFACE};
-    border: 1px solid {BORDER};
-    border-radius: 18px;
-    padding: 1.5rem 1.6rem 1.25rem;
-    box-shadow: 0 4px 24px {SHADOW};
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid rgba(0,94,172,0.12);
+    border-radius: 0;
+    padding: 1.15rem 0 1.15rem;
+    box-shadow: none;
     margin-bottom: 1.25rem;
-    transition: box-shadow 0.2s ease, transform 0.2s ease;
 }}
-.card:hover {{
-    box-shadow: 0 8px 40px rgba(0,94,172,0.12);
-    transform: translateY(-1px);
+
+.section-divider {{
+    height: 1px;
+    background: rgba(0,94,172,0.14);
+    margin: 0.75rem 0 1.25rem;
 }}
 
 /* ── Stat chips in hero ── */
@@ -253,6 +255,17 @@ html, body, [data-testid="stAppViewContainer"], .stApp {{
 }}
 .stFormSubmitButton > button:active, .stButton > button:active {{
     transform: translateY(0px) !important;
+}}
+
+.submit-row {{
+    display: flex;
+    justify-content: center;
+    margin-top: 0.75rem;
+}}
+
+.submit-row .stFormSubmitButton {{
+    width: 100%;
+    max-width: 340px;
 }}
 
 /* Download button */
@@ -478,14 +491,17 @@ with st.form("processing_form"):
         """, unsafe_allow_html=True)
 
         st.markdown("<div style='flex:1'></div>", unsafe_allow_html=True)
-        st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
-
         st.warning("⚠️ Keep this tab open while processing.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    button_left, button_mid, button_right = st.columns([1, 0.7, 1])
+    with button_mid:
+        st.markdown('<div class="submit-row">', unsafe_allow_html=True)
         process_clicked = st.form_submit_button(
             "🚀  Process files",
             use_container_width=True,
         )
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BANK PASSWORDS + STATS ROW
