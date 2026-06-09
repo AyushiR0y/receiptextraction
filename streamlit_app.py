@@ -13,7 +13,7 @@ import pdf_clean as extractor
 # ── Brand ──────────────────────────────────────────────────────────────────
 PRIMARY      = "#005EAC"
 PRIMARY_DARK = "#004A8C"
-PRIMARY_SOFT = "#E8F1FB"
+PRIMARY_SOFT = "#DAF8FF"
 ACCENT       = "#F58220"
 ACCENT_SOFT  = "#FEF0E4"
 BG           = "#F4F7FC"
@@ -430,7 +430,7 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="tip-banner">
-    💡 <strong>Tip:</strong>&nbsp;Folder upload works directly in the browser. The local path field only works when running the app on your own machine.
+    💡 <strong>Tip:</strong>&nbsp;Do not close the tab when running. Folder upload works directly in the browser. The local path field only works when running the app on your own machine.
 </div>
 """, unsafe_allow_html=True)
 
@@ -502,7 +502,6 @@ with st.form("processing_form"):
         st.markdown("<div style='flex:1'></div>", unsafe_allow_html=True)
         st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
 
-        st.warning("⚠️ Keep this tab open while processing.")
         process_clicked = st.form_submit_button(
             "🚀  Process files",
             use_container_width=True,
