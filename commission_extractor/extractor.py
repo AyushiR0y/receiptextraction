@@ -30,8 +30,7 @@ except Exception:  # pragma: no cover
 try:
     import easyocr
 except Exception:  # pragma: no cover
-    if os.getenv("EASYOCR_DISABLED", "0").strip().lower() in {"1", "true", "yes"}:
-        easyocr = None
+    easyocr = None
 
 try:
     import pytesseract
@@ -1153,15 +1152,28 @@ def _ai_row_to_output_fields(ai_row: Dict[str, object]) -> Dict[str, str]:
         "commissionamount": "BROKERAGE Amount",
         "cgst": "CGST @ 9%",
         "cgstamount": "CGST @ 9%",
+        "cgst9": "CGST @ 9%",
+        "cgst9percent": "CGST @ 9%",
         "sgst": "SGST @ 9%",
         "sgstamount": "SGST @ 9%",
+        "sgst9": "SGST @ 9%",
+        "sgst9percent": "SGST @ 9%",
         "igst": "IGST",
         "igstamount": "IGST",
+        "utgst": "UTGST",
+        "utgstamount": "UTGST",
         "gsttotalamount": "GST TOTAL AMT",
         "gsttotalamt": "GST TOTAL AMT",
         "gstawt": "GST TOTAL AMT",
         "gstamount": "GST TOTAL AMT",
         "narration": "Narration",
+        "datefrom": "DATE_FROM",
+        "periodstart": "DATE_FROM",
+        "periodstartdate": "DATE_FROM",
+        "dateto": "DATE_TO",
+        "periodend": "DATE_TO",
+        "periodenddate": "DATE_TO",
+        "agentcode": "AGENT_CODE",
     }
 
     result: Dict[str, str] = {col: "" for col in OUTPUT_COLUMNS}
@@ -1170,9 +1182,9 @@ def _ai_row_to_output_fields(ai_row: Dict[str, object]) -> Dict[str, str]:
         if not col:
             continue
         value = "" if raw_value is None else str(raw_value).strip()
-        if col in {"Total Inv Amt", "CGST @ 9%", "SGST @ 9%", "IGST", "GST TOTAL AMT"}:
+        if col in {"Total Inv Amt", "BROKERAGE Amount", "CGST @ 9%", "SGST @ 9%", "UTGST", "IGST", "GST TOTAL AMT"}:
             value = clean_amount(value)
-        elif col == "Vendor Inv Date":
+        elif col in {"Vendor Inv Date", "DATE_FROM", "DATE_TO"}:
             value = try_parse_date(value)
         elif col == "BALIC STATE":
             value = normalize_state_name(value)
@@ -3849,7 +3861,12 @@ def ocr_image_single(image: Image.Image, prefer_google: bool = False, force_goog
             LOGGER.warning("RapidOCR failed for image: %s", exc)
 
     vision_text = ""
-    should_try_vision = prefer_google or len(rapid_text.strip()) < 20
+    _gv_available = bool(get_google_vision_api_key())
+    should_try_vision = prefer_google or _gv_available or len(rapid_text.strip()) < 20
+    LOGGER.debug(
+        "ocr_image_single: prefer_google=%s force_google=%s gv_available=%s should_try_vision=%s rapid_chars=%d",
+        prefer_google, force_google, _gv_available, should_try_vision, len(rapid_text.strip()),
+    )
     if should_try_vision:
         vision_candidates: List[str] = []
         primary = ocr_image_with_google_vision(prepared)
@@ -3876,7 +3893,12 @@ def ocr_image_single(image: Image.Image, prefer_google: bool = False, force_goog
     if force_google and vision_text:
         return vision_text
 
-    # Open-source ensemble fallback when primary OCR is weak or cloud OCR is unavailable.
+    # When Google Vision is configured and returned usable text, use it directly.
+    # Skip EasyOCR / Tesseract entirely — they are only fallbacks for when GV is unavailable.
+    if vision_text and _gv_available:
+        return vision_text
+
+    # Open-source ensemble fallback: only runs when Google Vision is NOT configured or returned nothing.
     open_source_candidates: List[str] = [rapid_text]
     if score_receipt_ocr_text(rapid_text) < 90:
         easy_text = ocr_image_with_easyocr(prepared)
@@ -3926,6 +3948,7 @@ def ocr_image_with_google_vision(image: Image.Image) -> str:
     global GOOGLE_VISION_CALL_COUNT, GOOGLE_VISION_DISABLED_FOR_RUN, GOOGLE_VISION_API_KEY
     api_key = get_google_vision_api_key()
     if not api_key:
+        LOGGER.debug("Google Vision skipped: no API key configured (set GOOGLE_VISION_API_KEY env var)")
         return ""
 
     try:
@@ -3948,11 +3971,13 @@ def ocr_image_with_google_vision(image: Image.Image) -> str:
         )
         with _counters_lock:
             GOOGLE_VISION_CALL_COUNT += 1
+        LOGGER.debug("Google Vision API call #%d dispatched", GOOGLE_VISION_CALL_COUNT)
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read().decode("utf-8")
         parsed = json.loads(body)
         responses = parsed.get("responses", [])
         if not responses:
+            LOGGER.debug("Google Vision returned empty responses list")
             return ""
         first = responses[0]
         full_text = first.get("fullTextAnnotation", {}).get("text", "")
@@ -3960,6 +3985,7 @@ def ocr_image_with_google_vision(image: Image.Image) -> str:
             annotations = first.get("textAnnotations", [])
             if annotations:
                 full_text = annotations[0].get("description", "")
+        LOGGER.debug("Google Vision extracted %d chars", len(full_text))
         return normalize_text(full_text)
     except urllib.error.HTTPError as exc:
         body_text = ""
@@ -4373,6 +4399,47 @@ def extract_zip_to_temp(zip_path: Path) -> Path:
     return temp_dir
 
 
+def _detect_header_row(raw_df: "pd.DataFrame") -> int:
+    """Scan the first 15 rows of a header-less DataFrame and return the index
+    of the row that contains the most recognized field alias keys.
+    Returns 0 (first row is header) when no better candidate is found."""
+    best_row = 0
+    best_score = 0
+    for row_idx in range(min(15, len(raw_df))):
+        row = raw_df.iloc[row_idx]
+        score = 0
+        for val in row:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            key = _normalize_key(str(val))
+            if key in _KNOWN_FIELD_ALIAS_KEYS:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_row = row_idx
+    LOGGER.debug("Header row detection: best row=%d score=%d", best_row, best_score)
+    return best_row
+
+
+# Pre-built set of all alias keys for fast header-row detection
+_KNOWN_FIELD_ALIAS_KEYS: Set[str] = {
+    "agentname", "agentpan", "pan", "servicerecipient", "nameofservicereceipient",
+    "nameofservicerecipient", "recipient", "particulars", "description",
+    "balicgstn", "balicgstin", "brokergstin", "brokergstn", "brokergstnstate",
+    "brokergstinstate", "brokerstate", "state", "balicstate", "date",
+    "vendorinvdate", "invoicedate", "invdate", "invoicenumber", "invoiceno",
+    "billno", "billnumber", "vendorinvno", "invoiceamount", "totalinvamt",
+    "totalamount", "netamount", "amount", "taxableamount", "brokerageamount",
+    "commissionamount", "cgst", "cgstamount", "cgst9", "cgst9percent",
+    "sgst", "sgstamount", "sgst9", "sgst9percent", "igst", "igstamount",
+    "utgst", "utgstamount", "gsttotalamount", "gsttotalamt", "gstawt",
+    "gstamount", "narration", "datefrom", "periodstart", "periodstartdate",
+    "dateto", "periodend", "periodenddate", "agentcode",
+    # Raw exact matches (as they appear in BALIC INVOICE FORMAT.xlsb)
+    "brokerageamount", "vendorinvdate", "brokergstn", "agentcode",
+}
+
+
 def _excel_engine_for_path(path: Path) -> Optional[str]:
     suffix = path.suffix.lower()
     if suffix == ".xlsb":
@@ -4389,7 +4456,49 @@ def _is_meaningful_excel_value(value: object) -> bool:
     return bool(text and text.lower() != "nan")
 
 
+# Excel epoch starts 1900-01-01 (serial 1); pyxlsb returns dates as floats.
+# Valid range: 1 (1900-01-01) – 99999 (~2173).  Commission invoices are 2020-2027.
+_EXCEL_DATE_RANGE = (43831, 47483)  # 2020-01-01 to 2030-01-01
+
+
+def _excel_serial_to_date_str(value: object) -> str:
+    """Convert an Excel serial date float returned by pyxlsb to a DD/MM/YYYY string.
+    Returns "" when the value is not a recognisable serial date."""
+    import datetime as _dt
+    try:
+        serial = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if not (_EXCEL_DATE_RANGE[0] <= serial <= _EXCEL_DATE_RANGE[1]):
+        return ""
+    try:
+        # Excel epoch bug: day 0 = 1899-12-30 so offset by 2 days.
+        dt = _dt.datetime(1899, 12, 30) + _dt.timedelta(days=int(serial))
+        if 2020 <= dt.year <= 2027:
+            return dt.strftime("%d/%m/%Y")
+    except (OverflowError, ValueError):
+        pass
+    return ""
+
+
+def _preprocess_excel_row(row: Dict[str, object]) -> Dict[str, object]:
+    """Return a copy of the row with Excel serial-date floats converted to date strings
+    for columns that represent dates.  Non-date columns are passed through unchanged."""
+    date_col_keys: Set[str] = {"vendorinvdate", "invoicedate", "invdate", "date", "datefrom", "dateto", "periodstart", "periodend", "periodstartdate", "periodenddate"}
+    result: Dict[str, object] = {}
+    for k, v in row.items():
+        nk = _normalize_key(str(k))
+        if nk in date_col_keys and isinstance(v, (int, float)) and not (isinstance(v, float) and pd.isna(v)):
+            converted = _excel_serial_to_date_str(v)
+            result[k] = converted if converted else v
+        else:
+            result[k] = v
+    return result
+
+
 def _excel_row_to_fields(row: Dict[str, object], source_file: str, sheet_name: str, row_number: int) -> Optional[Dict[str, str]]:
+    # Convert Excel serial-date floats (pyxlsb returns dates as numbers) before mapping.
+    row = _preprocess_excel_row(row)
     row_text = " ".join(str(value).strip() for value in row.values() if _is_meaningful_excel_value(value))
     if not row_text:
         return None
@@ -4398,6 +4507,29 @@ def _excel_row_to_fields(row: Dict[str, object], source_file: str, sheet_name: s
     fields = backfill_agent_pan(fields, row_text, source_file=source_file)
     fields = normalize_mapping_anomalies(fields, row_text, Path(source_file))
     fields = enforce_tax_mode_fields(fields)
+    # Backfill BROKERAGE Amount from GST tax components when it was a formula cell
+    # (pyxlsb returns None for formula cells; CGST/SGST are typically hardcoded constants).
+    if not (fields.get("BROKERAGE Amount", "") or "").strip():
+        cgst = _amount_to_float(fields.get("CGST @ 9%", ""))
+        sgst = _amount_to_float(fields.get("SGST @ 9%", ""))
+        utgst = _amount_to_float(fields.get("UTGST", ""))
+        igst = _amount_to_float(fields.get("IGST", ""))
+        gst_total = _amount_to_float(fields.get("GST TOTAL AMT", ""))
+        if cgst > 0 and (sgst > 0 or utgst > 0):
+            brok = cgst / 0.09
+        elif igst > 0:
+            brok = igst / 0.18
+        elif gst_total > 0:
+            brok = gst_total / 0.18
+        else:
+            brok = 0.0
+        if brok > 0:
+            fields["BROKERAGE Amount"] = _fmt_amount(brok)
+    # Backfill Vendor Inv Date from source folder/file name when the cell was a formula.
+    if not (fields.get("Vendor Inv Date", "") or "").strip():
+        inferred = infer_plausible_date_from_text(source_file)
+        if inferred:
+            fields["Vendor Inv Date"] = inferred
     fields = apply_gst_autofill(fields)
     if not (fields.get("Narration", "") or "").strip():
         fields["Narration"] = "COMMISSION"
@@ -4416,14 +4548,25 @@ def process_spreadsheet(path: Path, source_hint: Optional[Path] = None, source_d
     effective_source = source_hint or path
     effective_display = source_display or str(path)
     engine = _excel_engine_for_path(path)
-    read_kwargs = {"sheet_name": None, "dtype": object}
+    base_kwargs: dict = {"sheet_name": None, "dtype": object}
     if engine:
-        read_kwargs["engine"] = engine
+        base_kwargs["engine"] = engine
+
+    workbook = None
     try:
-        workbook = pd.read_excel(path, **read_kwargs)
+        workbook = pd.read_excel(path, **base_kwargs)
     except Exception as exc:
-        LOGGER.warning("Failed to read spreadsheet %s: %s", path, exc)
-        return rows
+        # Files with a .xls extension are sometimes actually xlsx; retry with openpyxl.
+        if engine == "xlrd" or (path.suffix.lower() == ".xls" and workbook is None):
+            try:
+                workbook = pd.read_excel(path, sheet_name=None, dtype=object, engine="openpyxl")
+                LOGGER.info("Retried %s with openpyxl engine (file is xlsx despite .xls extension)", path.name)
+            except Exception as exc2:
+                LOGGER.warning("Failed to read spreadsheet %s: %s", path, exc2)
+                return rows
+        else:
+            LOGGER.warning("Failed to read spreadsheet %s: %s", path, exc)
+            return rows
 
     if isinstance(workbook, pd.DataFrame):
         workbook = {"Sheet1": workbook}
@@ -4431,6 +4574,36 @@ def process_spreadsheet(path: Path, source_hint: Optional[Path] = None, source_d
     for sheet_name, sheet_df in workbook.items():
         if sheet_df is None or sheet_df.empty:
             continue
+
+        # Auto-detect the true header row: some XLSB/XLS files have title rows
+        # before the actual column headers (e.g. company name, period, then headers).
+        # Read without a header to scan for the row with the most recognized field names.
+        try:
+            raw_no_header_kwargs = dict(base_kwargs)
+            raw_no_header_kwargs["header"] = None
+            # Use a single sheet read to avoid re-reading the whole workbook.
+            raw_sheet = pd.read_excel(
+                path,
+                sheet_name=sheet_name,
+                header=None,
+                dtype=object,
+                **({k: v for k, v in ({"engine": engine} if engine else {}).items()}),
+            )
+            best_header_row = _detect_header_row(raw_sheet)
+            if best_header_row > 0:
+                LOGGER.info(
+                    "Re-reading %s sheet '%s' with header at row %d",
+                    path.name, sheet_name, best_header_row,
+                )
+                reread_kwargs: dict = {"sheet_name": sheet_name, "dtype": object, "header": best_header_row}
+                if engine:
+                    reread_kwargs["engine"] = engine
+                sheet_df = pd.read_excel(path, **reread_kwargs)
+        except Exception as hdr_exc:
+            LOGGER.debug("Header-row detection failed for %s sheet '%s': %s", path.name, sheet_name, hdr_exc)
+
+        LOGGER.debug("Spreadsheet columns for %s [%s]: %s", path.name, sheet_name, list(sheet_df.columns)[:25])
+
         for row_number, row in sheet_df.iterrows():
             row_dict = {str(col): row[col] for col in sheet_df.columns if _is_meaningful_excel_value(row.get(col))}
             if not row_dict:
@@ -6296,11 +6469,16 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
     page_texts = pdf_page_texts(pdf_bytes, str(path), effective_password)
     needs_ocr = any(len(text.strip()) < 20 for _, text in page_texts)
     force_ocr = is_jk_bank_source(effective_source) or is_monetary_ocr_priority_source(effective_source)
+    LOGGER.debug(
+        "PDF %s: pages=%d needs_ocr=%s force_ocr=%s",
+        path.name, len(page_texts), needs_ocr, force_ocr,
+    )
 
     if force_ocr or needs_ocr:
         if force_ocr:
-            LOGGER.info("Forcing OCR for priority source: %s", path.name)
-        LOGGER.info("Low text confidence in %s, switching to OCR for weak pages", path.name)
+            LOGGER.info("Forcing OCR (Google Vision) for priority source: %s", path.name)
+        else:
+            LOGGER.info("Low text confidence in %s, switching to Google Vision OCR for weak pages", path.name)
         target_pages = None if force_ocr else [page for page, text in page_texts if len(text.strip()) < 20]
         ocr_texts = {
             page: text

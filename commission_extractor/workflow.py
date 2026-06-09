@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,10 +11,8 @@ from .io_ops import ReceiptLineItem, build_placeholder_row, find_candidate_files
 from .mapping import AGENT_CODE_BY_NAME, apply_agent_code_mapping_to_dataframe, load_agent_codes_from_xlsx
 
 LOGGER = _extractor.LOGGER
-GOOGLE_VISION_CALL_COUNT = _extractor.GOOGLE_VISION_CALL_COUNT
-AZURE_AI_CALL_COUNT = _extractor.AZURE_AI_CALL_COUNT
-AZURE_AI_INPUT_CHARS = _extractor.AZURE_AI_INPUT_CHARS
-AZURE_AI_OUTPUT_CHARS = _extractor.AZURE_AI_OUTPUT_CHARS
+# Do NOT copy the counter integers here — integers are immutable and the copy
+# would freeze at 0 forever.  Read them live from _extractor at summary time.
 
 
 def run(
@@ -131,10 +130,10 @@ def run(
     LOGGER.info("Wrote %s rows to %s", len(df), output_file)
     LOGGER.info(
         "Usage summary | google_vision_calls=%s | azure_ai_calls=%s | azure_ai_input_chars=%s | azure_ai_output_chars=%s",
-        GOOGLE_VISION_CALL_COUNT,
-        AZURE_AI_CALL_COUNT,
-        AZURE_AI_INPUT_CHARS,
-        AZURE_AI_OUTPUT_CHARS,
+        _extractor.GOOGLE_VISION_CALL_COUNT,
+        _extractor.AZURE_AI_CALL_COUNT,
+        _extractor.AZURE_AI_INPUT_CHARS,
+        _extractor.AZURE_AI_OUTPUT_CHARS,
     )
     return output_file
 
