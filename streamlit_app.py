@@ -7,8 +7,7 @@ from typing import Iterable
 import pandas as pd
 import streamlit as st
 
-import pdf_clean as extractor
-
+import commission_extractor.api as extractor
 
 # ── Brand ──────────────────────────────────────────────────────────────────
 PRIMARY      = "#005EAC"
