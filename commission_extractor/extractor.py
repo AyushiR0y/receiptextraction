@@ -76,6 +76,9 @@ GOOGLE_VISION_DISABLED_FOR_RUN = False
 AZURE_AI_CALL_COUNT = 0
 AZURE_AI_INPUT_CHARS = 0
 AZURE_AI_OUTPUT_CHARS = 0
+# Set True after a network/DNS failure so the optional AI math re-check stops
+# retrying (and log-flooding) for the remainder of the run.
+AZURE_MATH_VALIDATION_DISABLED = False
 
 # Thread-safety locks
 _rapidocr_lock = threading.Lock()
@@ -474,69 +477,83 @@ def _load_agent_details_sheet(df: "pd.DataFrame") -> None:
         LOGGER.debug("Loaded agent detail: code=%s name=%s pan=%s", code, name, pan)
 
 
-def load_agent_codes_from_xlsx(xlsx_path: str = "agentcode.xlsx") -> None:
-    """Load agent code mappings from agentcode.xlsx file.
-    
+def load_agent_codes_from_xlsx(xlsx_path: str = "agent_details_full.xlsx") -> None:
+    """Load agent code mappings from the agent master workbook.
+
     Populates:
     - AGENT_CODE_BY_NAME: normalized agent name -> agent code
     - AGENT_NAME_BY_CODE: agent code -> clean agent name
+    - AGENT_INFO_BY_PAN / AGENT_INFO_BY_CODE: full details incl. PAN/GSTN
+
+    The default source is ``agent_details_full.xlsx`` (sheet "Partner Details"
+    with AGENT_CODE / Name / PAN columns). A legacy ``agentcode.xlsx`` is still
+    honoured if present.
     """
     global AGENT_CODE_BY_NAME, AGENT_NAME_BY_CODE
     AGENT_CODE_BY_NAME.clear()
     AGENT_NAME_BY_CODE.clear()
-    
-    try:
-        agent_code_path = Path(xlsx_path)
-        if not agent_code_path.exists():
-            LOGGER.warning("Agent code file not found: %s", xlsx_path)
-            return
-        # Try to read all sheets; primary sheet contains AGENT_CODE/Name, optional second sheet contains full details including PAN/GSTN
-        sheets = pd.read_excel(agent_code_path, sheet_name=None)
-        # Primary: first sheet (or sheet named 'Sheet1'/'agent_codes')
-        first_sheet = None
-        for name, df in sheets.items():
-            first_sheet = df
-            break
-        if first_sheet is not None:
-            for _, row in first_sheet.iterrows():
-                code = str(row.get("AGENT_CODE", "") or row.get("Agent Code", "") or "").strip()
-                name = str(row.get("Name", "") or row.get("Agent Name", "") or "").strip()
-                if code and name:
-                    name_key = _normalize_agent_name_key(name)
-                    AGENT_CODE_BY_NAME[name_key] = code
-                    AGENT_NAME_BY_CODE[code] = name
-                    LOGGER.debug("Loaded agent code: %s -> %s", code, name)
 
-        # Optional full-details sheet: look for a sheet named 'agent_details_full' or the second sheet
-        details_sheet = None
-        if "agent_details_full" in {k.lower(): k for k in sheets.keys()}:
-            details_sheet = sheets[[k for k in sheets.keys() if k.lower() == "agent_details_full"][0]]
-        elif len(sheets) > 1:
-            # take second sheet
-            keys = list(sheets.keys())
-            details_sheet = sheets[keys[1]]
+    # Resolve candidate master workbooks robustly: caller-provided path, the
+    # standalone agent_details_full.xlsx, and the legacy agentcode.xlsx, checked
+    # both in the current working directory and next to this package.
+    module_dir = Path(__file__).resolve().parent
+    workspace_dir = module_dir.parent
+    candidate_names = [xlsx_path, "agent_details_full.xlsx", "agentcode.xlsx"]
+    search_roots = [Path("."), workspace_dir, module_dir]
 
-        if details_sheet is not None:
-            _load_agent_details_sheet(details_sheet)
-
-        LOGGER.info("Loaded %d agent codes from %s", len(AGENT_CODE_BY_NAME), xlsx_path)
-
-        # --- Also load the standalone agent_details_full.xlsx if it exists ---
-        details_standalone = Path(xlsx_path).parent / "agent_details_full.xlsx"
-        if not details_standalone.exists():
-            # Try same directory as the running script / cwd
-            details_standalone = Path("agent_details_full.xlsx")
-        if details_standalone.exists():
+    resolved_paths: List[Path] = []
+    seen_resolved: Set[str] = set()
+    for name in candidate_names:
+        name_path = Path(name)
+        roots = [name_path.parent] if name_path.is_absolute() else search_roots
+        for root in roots:
+            candidate = name_path if name_path.is_absolute() else (root / name_path.name)
             try:
-                det_df = pd.read_excel(details_standalone)
-                _load_agent_details_sheet(det_df)
-                LOGGER.info(
-                    "Loaded %d agent PAN records from %s", len(AGENT_INFO_BY_PAN), details_standalone
-                )
+                key = str(candidate.resolve()).lower()
+            except OSError:
+                key = str(candidate).lower()
+            if candidate.exists() and key not in seen_resolved:
+                seen_resolved.add(key)
+                resolved_paths.append(candidate)
+
+    if not resolved_paths:
+        LOGGER.warning(
+            "No agent master workbook found (looked for %s); agent codes will be blank.",
+            ", ".join(candidate_names),
+        )
+        return
+
+    try:
+        for agent_code_path in resolved_paths:
+            try:
+                sheets = pd.read_excel(agent_code_path, sheet_name=None)
             except Exception as exc:
-                LOGGER.warning("Failed to load agent_details_full.xlsx: %s", exc)
+                LOGGER.warning("Failed to read agent workbook %s: %s", agent_code_path, exc)
+                continue
+
+            # Load every sheet that exposes AGENT_CODE + Name so we do not depend
+            # on sheet ordering (e.g. "Partner Details" in agent_details_full.xlsx).
+            for sheet_name, df in sheets.items():
+                if df is None or df.empty:
+                    continue
+                cols_norm = {str(c).strip().lower() for c in df.columns}
+                has_code = bool({"agent_code", "agent code"} & cols_norm)
+                has_name = bool({"name", "agent name"} & cols_norm)
+                if not (has_code and has_name):
+                    continue
+                _load_agent_details_sheet(df)
+                LOGGER.info(
+                    "Loaded agent mappings from %s [sheet=%s]", agent_code_path.name, sheet_name
+                )
+
+        LOGGER.info(
+            "Loaded %d agent codes (%d PAN records) from %s",
+            len(AGENT_CODE_BY_NAME),
+            len(AGENT_INFO_BY_PAN),
+            ", ".join(p.name for p in resolved_paths),
+        )
     except Exception as exc:
-        LOGGER.warning("Failed to load agent codes from %s: %s", xlsx_path, exc)
+        LOGGER.warning("Failed to load agent codes: %s", exc)
 
 
 def find_best_matching_agent_code(extracted_name: str, similarity_threshold: float = 0.6) -> Tuple[Optional[str], Optional[str], float]:
@@ -1095,13 +1112,17 @@ def build_placeholder_row(source_file: str, source_page: str, reason: str) -> Re
 
 
 def get_azure_openai_deployment_candidates(preferred: str) -> List[str]:
+    # Honor the explicitly configured deployment first. Hardcoded model names are
+    # only last-resort fallbacks so we never silently override the operator's
+    # chosen model (e.g. jumping onto gpt-5-mini when gpt-4o-mini is configured).
     candidates = [
         (os.getenv("AZURE_OPENAI_DEPLOYMENT_MINI") or "").strip(),
         (os.getenv("AZURE_OPENAI_MINI_DEPLOYMENT_NAME") or "").strip(),
-        "gpt-4o-mini",
         (preferred or "").strip(),
         (os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or "").strip(),
         (os.getenv("AZURE_OPENAI_DEPLOYMENT") or "").strip(),
+        "gpt-4o-mini",
+        "gpt-5-mini",
     ]
     seen: Set[str] = set()
     ordered: List[str] = []
@@ -1389,6 +1410,47 @@ from .tax_logic import (
 )
 
 
+def _is_gpt5_family_deployment(deployment: str) -> bool:
+    """Return True for reasoning/next-gen models (gpt-5*, o1*, o3*) that reject
+    the classic `max_tokens` / non-default `temperature` chat parameters."""
+    name = (deployment or "").strip().lower()
+    return bool(re.search(r"(?:^|[^a-z0-9])(?:gpt-?5|o1|o3|o4)(?:[^a-z0-9]|$)", name))
+
+
+def _build_chat_payload(
+    messages: List[Dict[str, str]],
+    deployment: str,
+    max_tokens: int,
+    *,
+    temperature: float = 0,
+    json_object: bool = True,
+) -> Dict[str, object]:
+    """Build a chat/completions payload compatible with the target deployment.
+
+    gpt-5 / o-series reasoning models use `max_completion_tokens` and only allow
+    the default temperature, whereas gpt-4o-class models use `max_tokens`.
+
+    Reasoning models spend part of `max_completion_tokens` on hidden reasoning
+    before emitting the answer, so a budget sized for gpt-4o (e.g. 1800) can
+    leave the JSON output truncated -> missing fields. We therefore raise the
+    budget generously and request minimal reasoning effort so the visible JSON
+    is complete and deterministic.
+    """
+    payload: Dict[str, object] = {"messages": messages}
+    if _is_gpt5_family_deployment(deployment):
+        # Reserve headroom for reasoning tokens so the JSON answer is not cut off.
+        payload["max_completion_tokens"] = max(4096, max_tokens * 3)
+        # Keep reasoning light: we want fast, faithful extraction, not deep
+        # multi-step reasoning that burns the token budget.
+        payload["reasoning_effort"] = "minimal"
+    else:
+        payload["max_tokens"] = max_tokens
+        payload["temperature"] = temperature
+    if json_object:
+        payload["response_format"] = {"type": "json_object"}
+    return payload
+
+
 def extract_receipts_with_azure_llm(page_text: str, source_file: str, page_num: int, context_hint: str = "") -> List[Dict[str, str]]:
     global AZURE_OPENAI_WORKING_DEPLOYMENT
     global AZURE_AI_CALL_COUNT
@@ -1465,21 +1527,17 @@ def extract_receipts_with_azure_llm(page_text: str, source_file: str, page_num: 
         + page_text[:24000]
     )
 
-    payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0,
-        "max_tokens": 1800,
-        "response_format": {"type": "json_object"},
-    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
     deployments = get_azure_openai_deployment_candidates(deployment)
     if AZURE_OPENAI_WORKING_DEPLOYMENT and AZURE_OPENAI_WORKING_DEPLOYMENT in deployments:
         deployments = [AZURE_OPENAI_WORKING_DEPLOYMENT] + [d for d in deployments if d != AZURE_OPENAI_WORKING_DEPLOYMENT]
 
     for dep in deployments:
+        payload = _build_chat_payload(messages, dep, max_tokens=1800)
         url = (
             f"{endpoint}/openai/deployments/{urllib.parse.quote(dep, safe='')}/chat/completions"
             f"?api-version={urllib.parse.quote(api_version, safe='')}"
@@ -1534,6 +1592,52 @@ def extract_receipts_with_azure_llm(page_text: str, source_file: str, page_num: 
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 continue
+            # Some older Azure API versions reject the `reasoning_effort` (or
+            # `max_completion_tokens`) parameter with a 400. Retry once with a
+            # sanitized payload so a parameter quirk never drops the extraction.
+            if exc.code == 400 and ("reasoning_effort" in payload or "max_completion_tokens" in payload):
+                try:
+                    err_body = exc.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    err_body = ""
+                if "reasoning_effort" in err_body or "unsupported" in err_body.lower() or "max_completion_tokens" in err_body:
+                    retry_payload = dict(payload)
+                    retry_payload.pop("reasoning_effort", None)
+                    try:
+                        retry_request = urllib.request.Request(
+                            url=url,
+                            data=json.dumps(retry_payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "api-key": api_key},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(retry_request, timeout=45) as response:
+                            body = response.read().decode("utf-8", errors="ignore")
+                        parsed = json.loads(body)
+                        content = (
+                            parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        )
+                        with _counters_lock:
+                            AZURE_AI_OUTPUT_CHARS += len(content or "")
+                        if not content:
+                            AZURE_OPENAI_WORKING_DEPLOYMENT = dep
+                            return []
+                        content = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.IGNORECASE)
+                        content = re.sub(r"\s*```$", "", content.strip())
+                        obj = json.loads(content)
+                        receipts = obj.get("receipts", []) if isinstance(obj, dict) else []
+                        rows2: List[Dict[str, str]] = []
+                        if isinstance(receipts, list):
+                            for item in receipts:
+                                if not isinstance(item, dict):
+                                    continue
+                                row = _ai_row_to_output_fields(item)
+                                if is_valid_invoice_no(row.get("Vendor Inv No", "")):
+                                    rows2.append(row)
+                        AZURE_OPENAI_WORKING_DEPLOYMENT = dep
+                        return rows2
+                    except Exception as retry_exc:
+                        LOGGER.warning("Azure retry (no reasoning_effort) failed on %s page %s: %s", source_file, page_num, retry_exc)
+                        return []
             LOGGER.warning("Azure receipt extraction failed on %s page %s (deployment=%s): %s", source_file, page_num, dep, exc)
             return []
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
@@ -4762,6 +4866,291 @@ def validate_math_extraction(row: Dict[str, str]) -> Tuple[bool, str]:
         
     except (ValueError, TypeError, AttributeError):
         return (False, "Could not parse amounts for validation")
+
+
+def _arithmetic_math_check(row: Dict[str, str]) -> Tuple[bool, str]:
+    """Deterministic guard used to prevent false positives during the post-run
+    validation pass. Verifies the two core identities:
+      * GST TOTAL AMT == CGST + SGST/UTGST   (split mode), or
+        GST TOTAL AMT == IGST                (integrated mode)
+      * BROKERAGE Amount + GST TOTAL AMT == Total Inv Amt
+    Tolerances are tight (1 rupee / 0.5%) so only genuinely balanced rows pass.
+    """
+    try:
+        brok = _amount_to_float(row.get("BROKERAGE Amount", ""))
+        cgst = _amount_to_float(row.get("CGST @ 9%", ""))
+        sgst = _amount_to_float(row.get("SGST @ 9%", ""))
+        utgst = _amount_to_float(row.get("UTGST", ""))
+        igst = _amount_to_float(row.get("IGST", ""))
+        gst_total = _amount_to_float(row.get("GST TOTAL AMT", ""))
+        total_inv = _amount_to_float(row.get("Total Inv Amt", ""))
+
+        if brok <= 0 or gst_total <= 0:
+            return (False, "Missing brokerage or GST total")
+
+        state_component = sgst if sgst > 0 else utgst
+        split_sum = cgst + state_component
+        has_split = cgst > 0 and state_component > 0
+        has_igst = igst > 0
+
+        if has_split and has_igst:
+            return (False, "Both IGST and CGST/SGST present (ambiguous tax mode)")
+        if not has_split and not has_igst:
+            return (False, "No valid tax components present")
+
+        # 1) GST TOTAL identity
+        if has_igst:
+            components = igst
+        else:
+            components = split_sum
+        gst_tol = max(1.0, gst_total * 0.005)
+        if abs(gst_total - components) > gst_tol:
+            return (False, f"GST TOTAL {gst_total:.2f} != components {components:.2f}")
+
+        # For split mode the two halves must match each other.
+        if has_split:
+            half_tol = max(1.0, max(cgst, state_component) * 0.02)
+            if abs(cgst - state_component) > half_tol:
+                return (False, f"CGST {cgst:.2f} != SGST/UTGST {state_component:.2f}")
+
+        # 2) Total = Brokerage + GST identity (only when Total is present)
+        if total_inv > 0:
+            total_tol = max(1.0, total_inv * 0.005)
+            if abs(total_inv - (brok + gst_total)) > total_tol:
+                return (False, f"Total {total_inv:.2f} != Brokerage {brok:.2f} + GST {gst_total:.2f}")
+
+        return (True, "Arithmetic valid")
+    except (ValueError, TypeError, AttributeError):
+        return (False, "Could not parse amounts for arithmetic check")
+
+
+def validate_math_with_azure_llm(row: Dict[str, str]) -> Tuple[Optional[bool], str]:
+    """Ask the LLM to independently verify the commission math for one row.
+
+    Returns (True/False/None, reason). None means the check was inconclusive
+    (e.g. Azure not configured or a transient error) and callers must NOT treat
+    that as a pass.
+    """
+    global AZURE_MATH_VALIDATION_DISABLED
+    if AZURE_MATH_VALIDATION_DISABLED:
+        return (None, "Azure math validation disabled after connectivity failure")
+
+    config = get_azure_openai_config()
+    if not config:
+        return (None, "Azure OpenAI not configured")
+
+    endpoint, api_key, deployment, api_version = config
+
+    fields = {
+        "BROKERAGE Amount": row.get("BROKERAGE Amount", ""),
+        "CGST @ 9%": row.get("CGST @ 9%", ""),
+        "SGST @ 9%": row.get("SGST @ 9%", ""),
+        "UTGST": row.get("UTGST", ""),
+        "IGST": row.get("IGST", ""),
+        "GST TOTAL AMT": row.get("GST TOTAL AMT", ""),
+        "Total Inv Amt": row.get("Total Inv Amt", ""),
+    }
+
+    system_prompt = (
+        "You are a strict financial auditor verifying commission invoice arithmetic. "
+        "You are given numeric fields for ONE invoice row. Verify these identities using the numbers only:\n"
+        "  1. GST TOTAL AMT must equal (CGST + SGST) when the split GST mode is used, "
+        "OR GST TOTAL AMT must equal IGST when the integrated mode is used. Exactly one mode should be non-zero.\n"
+        "  2. BROKERAGE Amount + GST TOTAL AMT must equal Total Inv Amt (skip this check only if Total Inv Amt is blank/zero).\n"
+        "Treat blank as zero. Allow rounding differences of at most 1 rupee. "
+        "Be conservative: if the numbers do not clearly satisfy the identities, mark it invalid. "
+        "Return JSON only: {\"valid\": true|false, \"reason\": \"short explanation\"}."
+    )
+    user_prompt = "Invoice numeric fields:\n" + json.dumps(fields, ensure_ascii=False)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    deployments = get_azure_openai_deployment_candidates(deployment)
+    global AZURE_OPENAI_WORKING_DEPLOYMENT
+    if AZURE_OPENAI_WORKING_DEPLOYMENT and AZURE_OPENAI_WORKING_DEPLOYMENT in deployments:
+        deployments = [AZURE_OPENAI_WORKING_DEPLOYMENT] + [d for d in deployments if d != AZURE_OPENAI_WORKING_DEPLOYMENT]
+
+    global AZURE_AI_CALL_COUNT, AZURE_AI_INPUT_CHARS, AZURE_AI_OUTPUT_CHARS
+    for dep in deployments:
+        payload = _build_chat_payload(messages, dep, max_tokens=300)
+        url = (
+            f"{endpoint}/openai/deployments/{urllib.parse.quote(dep, safe='')}/chat/completions"
+            f"?api-version={urllib.parse.quote(api_version, safe='')}"
+        )
+        try:
+            with _counters_lock:
+                AZURE_AI_CALL_COUNT += 1
+                AZURE_AI_INPUT_CHARS += len(user_prompt)
+            request = urllib.request.Request(
+                url=url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "api-key": api_key},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=45) as response:
+                body = response.read().decode("utf-8", errors="ignore")
+            parsed = json.loads(body)
+            content = (
+                parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+            )
+            with _counters_lock:
+                AZURE_AI_OUTPUT_CHARS += len(content or "")
+            if not content:
+                AZURE_OPENAI_WORKING_DEPLOYMENT = dep
+                return (None, "Empty AI response")
+            content = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.IGNORECASE)
+            content = re.sub(r"\s*```$", "", content.strip())
+            obj = json.loads(content)
+            AZURE_OPENAI_WORKING_DEPLOYMENT = dep
+            if not isinstance(obj, dict) or "valid" not in obj:
+                return (None, "Malformed AI response")
+            return (bool(obj.get("valid")), str(obj.get("reason", "")).strip())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue
+            LOGGER.warning("Azure math validation failed (deployment=%s): %s", dep, exc)
+            return (None, f"AI error: {exc}")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            # A DNS/connection failure means the endpoint is unreachable for the
+            # whole run; disable further AI math checks to avoid log-flooding.
+            reason = getattr(exc, "reason", exc)
+            is_conn_failure = isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError)
+            if is_conn_failure:
+                AZURE_MATH_VALIDATION_DISABLED = True
+                LOGGER.warning(
+                    "Azure math validation unreachable (%s); disabling AI math re-check for this run.",
+                    reason,
+                )
+                return (None, f"AI unreachable: {reason}")
+            LOGGER.warning("Azure math validation failed (deployment=%s): %s", dep, exc)
+            return (None, f"AI error: {exc}")
+
+    return (None, "No valid deployment for math validation")
+
+
+def revalidate_rows_math(rows: List["ReceiptLineItem"], use_ai: bool = True) -> int:
+    """Post-extraction pass that re-checks the commission math on every row and
+    downgrades any 'Math Valid = YES' that is not genuinely valid.
+
+    A row is only allowed to keep/receive Math Valid = YES when BOTH the
+    deterministic arithmetic check passes AND (when available) the AI auditor
+    confirms it. This layered agreement guarantees no false positives: a row can
+    never be flipped from NO to YES by this pass, only confirmed or downgraded.
+    """
+    global AZURE_MATH_VALIDATION_DISABLED
+    # Fresh start each run so a previous run's connectivity failure doesn't
+    # permanently disable the AI check.
+    AZURE_MATH_VALIDATION_DISABLED = False
+    ai_available = use_ai and get_azure_openai_config() is not None
+    downgraded = 0
+    for item in rows:
+        values = item.values
+        current = (values.get("Math Valid", "") or "").strip()
+        # Only rows that currently claim validity are at risk of being false positives.
+        if not current.upper().startswith("YES"):
+            continue
+
+        arith_ok, arith_reason = _arithmetic_math_check(values)
+        if not arith_ok:
+            values["Math Valid"] = f"NO: {arith_reason} (post-run recheck)"
+            downgraded += 1
+            continue
+
+        if ai_available:
+            ai_valid, ai_reason = validate_math_with_azure_llm(values)
+            if ai_valid is False:
+                values["Math Valid"] = f"NO: {ai_reason or 'AI math check failed'} (AI recheck)"
+                downgraded += 1
+                continue
+            # ai_valid is True -> confirmed; ai_valid is None -> inconclusive,
+            # keep the arithmetic-confirmed YES.
+    if downgraded:
+        LOGGER.info("Post-run math validation downgraded %s row(s) from YES to NO", downgraded)
+    return downgraded
+
+
+def validate_excel_math(xlsx_path: "os.PathLike | str", use_ai: bool = True) -> Dict[str, object]:
+    """Final safety net: read the generated Excel back and guarantee every row
+    marked ``Math Valid = YES`` is genuinely valid — no false positives.
+
+    This re-runs the deterministic arithmetic identities (and, when reachable,
+    the AI auditor) on the persisted workbook. Any row that claims YES but does
+    not actually satisfy the math is rewritten to ``NO: ...`` and the workbook is
+    saved in place. Returns a small summary dict for logging.
+
+    A row can only ever be *downgraded* here (YES -> NO); it is never promoted,
+    so this pass cannot introduce false positives of its own.
+    """
+    summary: Dict[str, object] = {"checked": 0, "downgraded": 0, "still_valid": 0, "corrected": False}
+    path = Path(xlsx_path)
+    if not path.exists():
+        LOGGER.warning("validate_excel_math: file not found: %s", path)
+        return summary
+
+    try:
+        df = pd.read_excel(path, dtype=str)
+    except Exception as exc:
+        LOGGER.warning("validate_excel_math: could not read %s: %s", path, exc)
+        return summary
+
+    if df.empty or "Math Valid" not in df.columns:
+        return summary
+
+    global AZURE_MATH_VALIDATION_DISABLED
+    AZURE_MATH_VALIDATION_DISABLED = False
+    ai_available = use_ai and get_azure_openai_config() is not None
+
+    changed = False
+    for idx, row in df.iterrows():
+        current = (str(row.get("Math Valid", "")) if pd.notna(row.get("Math Valid", "")) else "").strip()
+        if not current.upper().startswith("YES"):
+            continue
+        summary["checked"] = int(summary["checked"]) + 1
+
+        # Build a plain string dict for the checkers.
+        values = {
+            col: ("" if pd.isna(row.get(col, "")) else str(row.get(col, "")))
+            for col in df.columns
+        }
+
+        arith_ok, arith_reason = _arithmetic_math_check(values)
+        if not arith_ok:
+            df.at[idx, "Math Valid"] = f"NO: {arith_reason} (excel recheck)"
+            summary["downgraded"] = int(summary["downgraded"]) + 1
+            changed = True
+            continue
+
+        if ai_available:
+            ai_valid, ai_reason = validate_math_with_azure_llm(values)
+            if ai_valid is False:
+                df.at[idx, "Math Valid"] = f"NO: {ai_reason or 'AI math check failed'} (excel AI recheck)"
+                summary["downgraded"] = int(summary["downgraded"]) + 1
+                changed = True
+                continue
+
+        summary["still_valid"] = int(summary["still_valid"]) + 1
+
+    if changed:
+        try:
+            df.to_excel(path, index=False)
+            summary["corrected"] = True
+            LOGGER.info(
+                "validate_excel_math: corrected %s false-positive row(s) in %s",
+                summary["downgraded"],
+                path,
+            )
+        except Exception as exc:
+            LOGGER.warning("validate_excel_math: failed to rewrite %s: %s", path, exc)
+    else:
+        LOGGER.info(
+            "validate_excel_math: verified %s YES row(s) in %s — no false positives",
+            summary["checked"],
+            path,
+        )
+    return summary
 
 
 def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:

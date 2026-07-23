@@ -115,6 +115,16 @@ def run(
     # After iterating all files, build final dataframe (for audit/reconciliation)
     df = rows_to_dataframe(all_rows)
 
+    # Post-extraction AI + arithmetic re-validation of the commission math so that
+    # any row marked "Math Valid = YES" is genuinely valid (no false positives).
+    try:
+        LOGGER.info("Running post-extraction math validation on %s rows", len(all_rows))
+        _extractor.revalidate_rows_math(all_rows)
+        # Rebuild the dataframe so downgraded "Math Valid" values are reflected.
+        df = rows_to_dataframe(all_rows)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.warning("Post-extraction math validation failed: %s", exc)
+
     if not df.empty and AGENT_CODE_BY_NAME:
         df = apply_agent_code_mapping_to_dataframe(df)
 
@@ -128,6 +138,13 @@ def run(
         audit_output=audit_output,
     )
     LOGGER.info("Wrote %s rows to %s", len(df), output_file)
+
+    # Final safety net: re-validate the written workbook so no row marked
+    # "Math Valid = YES" is a false positive. Corrects the file in place.
+    try:
+        _extractor.validate_excel_math(output_file)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.warning("Final Excel math validation failed: %s", exc)
     LOGGER.info(
         "Usage summary | google_vision_calls=%s | azure_ai_calls=%s | azure_ai_input_chars=%s | azure_ai_output_chars=%s",
         _extractor.GOOGLE_VISION_CALL_COUNT,

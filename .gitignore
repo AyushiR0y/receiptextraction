@@ -45,3 +45,11 @@ poppler-*/
 # Debug and test scripts (keep pdf_clean.py, pdf_llm.py, requirements.txt)
 verify_fix.py
 inspect_tax_invoice_text.py
+test_agent_mapping.py
+
+# Logs and runtime caches (not needed for execution)
+*.log
+.ocr_cache/
+._*
+_temp_*.py
+_validation_outputs/

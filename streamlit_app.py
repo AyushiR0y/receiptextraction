@@ -649,6 +649,14 @@ if process_clicked:
             all_rows.append(extractor.build_placeholder_row(str(file_path), "", f"Extraction failed: {exc}"))
         progress.progress(index / total)
 
+    # Post-extraction AI + arithmetic re-validation of the commission math so that
+    # any row marked "Math Valid = YES" is genuinely valid (no false positives).
+    try:
+        _append_log(st.session_state.logs, "Running post-extraction math validation…", log_placeholder)
+        extractor.revalidate_rows_math(all_rows)
+    except Exception as exc:
+        _append_log(st.session_state.logs, f"  → math validation skipped: {exc}", log_placeholder)
+
     df = extractor.rows_to_dataframe(all_rows)
     if not df.empty and extractor.AGENT_CODE_BY_NAME:
         df = extractor.apply_agent_code_mapping_to_dataframe(df)
@@ -656,6 +664,20 @@ if process_clicked:
     output_dir  = Path(tempfile.mkdtemp(prefix="commission_streamlit_output_"))
     output_file = output_dir / "commission_results.xlsx"
     df.to_excel(output_file, index=False)
+
+    # Final safety net: re-validate the written workbook so no "Math Valid = YES"
+    # row is a false positive (corrects the file in place if needed).
+    try:
+        summary = extractor.validate_excel_math(output_file)
+        if summary.get("downgraded"):
+            _append_log(
+                st.session_state.logs,
+                f"  → math validation corrected {summary['downgraded']} false positive(s)",
+                log_placeholder,
+            )
+    except Exception as exc:
+        _append_log(st.session_state.logs, f"  → final math validation skipped: {exc}", log_placeholder)
+
     st.session_state.result_path = str(output_file)
 
     _append_log(st.session_state.logs, f"✅ Wrote {len(df)} row(s) to {output_file}", log_placeholder)
