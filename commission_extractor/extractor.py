@@ -4952,14 +4952,15 @@ def validate_math_with_azure_llm(row: Dict[str, str]) -> Tuple[Optional[bool], s
     }
 
     system_prompt = (
-        "You are a strict financial auditor verifying commission invoice arithmetic. "
-        "You are given numeric fields for ONE invoice row. Verify these identities using the numbers only:\n"
-        "  1. GST TOTAL AMT must equal (CGST + SGST) when the split GST mode is used, "
-        "OR GST TOTAL AMT must equal IGST when the integrated mode is used. Exactly one mode should be non-zero.\n"
-        "  2. BROKERAGE Amount + GST TOTAL AMT must equal Total Inv Amt (skip this check only if Total Inv Amt is blank/zero).\n"
-        "Treat blank as zero. Allow rounding differences of at most 1 rupee. "
-        "Be conservative: if the numbers do not clearly satisfy the identities, mark it invalid. "
-        "Return JSON only: {\"valid\": true|false, \"reason\": \"short explanation\"}."
+        "You are verifying arithmetic only. "
+        "Do NOT determine whether the GST mode is correct; it has already been determined by software. "
+        "Only check the following:\n"
+        "1. If IGST > 0, verify GST TOTAL AMT == IGST.\n"
+        "2. Otherwise, verify GST TOTAL AMT == CGST + SGST (or CGST + UTGST).\n"
+        "3. Verify BROKERAGE Amount + GST TOTAL AMT == Total Inv Amt (if Total Inv Amt is present).\n"
+        "Treat blanks as zero. Allow up to 1 rupee rounding difference. "
+        "Return only JSON: "
+        "{\"results\":[{\"id\":1,\"valid\":true,\"reason\":\"\"}]}"
     )
     user_prompt = "Invoice numeric fields:\n" + json.dumps(fields, ensure_ascii=False)
 
