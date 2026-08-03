@@ -6857,7 +6857,11 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
 
     effective_password = override_password or infer_password_from_path(effective_source)
     page_texts = pdf_page_texts(pdf_bytes, str(path), effective_password)
-    needs_ocr = any(len(text.strip()) < 20 for _, text in page_texts)
+    # Use MIN_OCR_ALNUM_SCORE as the trigger threshold so that any page whose
+    # text would be dropped as "low confidence" is first re-processed via OCR.
+    # Previously the threshold was 20 (too low), causing pages with 20-49 chars
+    # to bypass OCR and then be silently skipped by the low_conf_receipt guard.
+    needs_ocr = any(score_ocr_text(text) < MIN_OCR_ALNUM_SCORE for _, text in page_texts)
     force_ocr = is_jk_bank_source(effective_source) or is_monetary_ocr_priority_source(effective_source)
     LOGGER.debug(
         "PDF %s: pages=%d needs_ocr=%s force_ocr=%s",
@@ -6869,7 +6873,7 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
             LOGGER.info("Forcing OCR (Google Vision) for priority source: %s", path.name)
         else:
             LOGGER.info("Low text confidence in %s, switching to Google Vision OCR for weak pages", path.name)
-        target_pages = None if force_ocr else [page for page, text in page_texts if len(text.strip()) < 20]
+        target_pages = None if force_ocr else [page for page, text in page_texts if score_ocr_text(text) < MIN_OCR_ALNUM_SCORE]
         ocr_texts = {
             page: text
             for page, text in pdf_ocr_page_texts(
@@ -6886,7 +6890,14 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
             if force_ocr:
                 merged_text = ocr_texts.get(page_num, "") or text
             else:
-                merged_text = text if len(text.strip()) >= 20 else ocr_texts.get(page_num, "")
+                # Use OCR text whenever the native-extracted text would be too weak
+                # to pass the low_conf_receipt guard (score < MIN_OCR_ALNUM_SCORE).
+                ocr_candidate = ocr_texts.get(page_num, "")
+                if score_ocr_text(text) < MIN_OCR_ALNUM_SCORE:
+                    merged_text = ocr_candidate if ocr_candidate else text
+                else:
+                    # Native text is good; use OCR only if it is markedly better.
+                    merged_text = text if score_ocr_text(text) >= score_ocr_text(ocr_candidate) else ocr_candidate
             merged.append((page_num, merged_text))
         page_texts = merged
 
