@@ -6890,6 +6890,24 @@ def process_pdf(path: Path, override_password: Optional[str], source_hint: Optio
             merged.append((page_num, merged_text))
         page_texts = merged
 
+    # Warn when OCR produced no usable text — this is the primary silent-failure
+    # mode on cloud deployments where GOOGLE_VISION_API_KEY is not configured.
+    empty_pages = [p for p, t in page_texts if not t.strip()]
+    if empty_pages and (needs_ocr or force_ocr):
+        gv_key = get_google_vision_api_key()
+        if not gv_key:
+            LOGGER.warning(
+                "%s: OCR returned empty text for page(s) %s and GOOGLE_VISION_API_KEY is not set. "
+                "Set GOOGLE_VISION_API_KEY in Streamlit secrets (or .env) to enable cloud OCR for scanned PDFs.",
+                path.name, empty_pages,
+            )
+        else:
+            LOGGER.warning(
+                "%s: OCR returned empty text for page(s) %s even though Google Vision is configured. "
+                "Check that RapidOCR / EasyOCR / Tesseract are installed as open-source fallbacks.",
+                path.name, empty_pages,
+            )
+
     for page_num, page_text in page_texts:
         if not page_text.strip():
             continue

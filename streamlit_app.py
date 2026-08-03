@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import Iterable
@@ -8,6 +9,27 @@ import pandas as pd
 import streamlit as st
 
 import commission_extractor.api as extractor
+
+# ── Propagate Streamlit secrets into os.environ so extractor can find API keys ──
+# On Streamlit Cloud, secrets live in st.secrets, not os.environ.
+# Keys recognised by the extractor (Google Vision, Azure OpenAI, etc.) are forwarded here.
+_SECRET_KEYS = [
+    "GOOGLE_VISION_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_DEPLOYMENT",
+    "AZURE_OPENAI_API_VERSION",
+]
+try:
+    for _k in _SECRET_KEYS:
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = str(st.secrets[_k])
+    # Reset the extractor's cached API-key values so they are re-read from the
+    # now-populated environment on the first call of this session.
+    extractor._extractor.GOOGLE_VISION_API_KEY = None
+    extractor._extractor.AZURE_OPENAI_CONFIG_CACHE = None
+except Exception:
+    pass  # st.secrets not available (local run without secrets.toml) — no-op
 
 # ── Brand ──────────────────────────────────────────────────────────────────
 PRIMARY      = "#005EAC"
@@ -644,6 +666,14 @@ if process_clicked:
                 _append_log(st.session_state.logs, f"  → {len(rows)} row(s) extracted", log_placeholder)
             else:
                 _append_log(st.session_state.logs, "  → no extractable receipt rows", log_placeholder)
+                # Hint the user when this looks like a scanned PDF and Vision is not configured.
+                if str(file_path).lower().endswith(".pdf") and not extractor._extractor.get_google_vision_api_key():
+                    _append_log(
+                        st.session_state.logs,
+                        "  ⚠ This may be a scanned PDF.  GOOGLE_VISION_API_KEY is not set — "
+                        "add it to Streamlit secrets so cloud OCR is available.",
+                        log_placeholder,
+                    )
         except Exception as exc:
             _append_log(st.session_state.logs, f"  → failed: {exc}", log_placeholder)
             all_rows.append(extractor.build_placeholder_row(str(file_path), "", f"Extraction failed: {exc}"))
