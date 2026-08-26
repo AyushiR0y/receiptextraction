@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import os
-import smtplib
 import datetime
 import tempfile
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Iterable
 
@@ -413,18 +411,29 @@ def _append_log(logs: list[str], message: str, placeholder) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MIS EMAIL LOGGING
-# Automatically emails a usage/MIS report to the admin after every run.
-# The visitor is not prompted and does not need to press anything.
-# Configure SMTP credentials via st.secrets (or environment variables):
-#   SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, MIS_EMAIL_FROM
-# MIS_EMAIL_TO defaults to MIS_RECIPIENT_PLACEHOLDER below when not set.
+# MIS TRACKING — Google Sheets via Apps Script
+# After every run, one row is silently appended to a Google Sheet you own.
+# The visitor sees nothing. No SMTP, no webhook, no corporate firewall issues.
+# This works because the POST goes from Streamlit Cloud → script.google.com
+# (plain HTTPS — not blocked by any known corporate policy).
+#
+# Setup (one-time, ~5 minutes):
+#   1. Go to https://sheets.google.com and create a new sheet called
+#      "Commission MIS Log" (or any name you like).
+#   2. Go to https://script.google.com → New Project → paste the Apps Script
+#      code from mis_appscript.gs in this repo → Save → Deploy → New deployment
+#      → Type: Web app → Execute as: Me → Who has access: Anyone → Deploy.
+#   3. Copy the generated Web app URL and add it as a Streamlit secret:
+#        MIS_GOOGLE_SHEET_URL = "https://script.google.com/macros/s/.../exec"
 # ─────────────────────────────────────────────────────────────────────────────
-MIS_RECIPIENT_PLACEHOLDER = "your-email@example.com"  # ← replace with your address
+
+import json
+import urllib.request
+import urllib.error
 
 
 def _get_secret(key: str, default: str = "") -> str:
-    """Read a value from st.secrets first, then environment, then default."""
+    """Read a value from st.secrets first, then os.environ, then default."""
     try:
         if key in st.secrets:
             return str(st.secrets[key])
@@ -439,90 +448,33 @@ def _count_pdf_pages(path: Path) -> int:
         return 0
     try:
         from pypdf import PdfReader
-
-        reader = PdfReader(str(path))
-        return len(reader.pages)
+        return len(PdfReader(str(path)).pages)
     except Exception:
         return 0
 
 
-def _send_mis_email(subject: str, body: str) -> tuple[bool, str]:
-    """Send the MIS report via SMTP. Returns (success, detail)."""
-    host = _get_secret("SMTP_HOST")
-    port = int(_get_secret("SMTP_PORT", "587") or "587")
-    user = _get_secret("SMTP_USERNAME")
-    password = _get_secret("SMTP_PASSWORD")
-    sender = _get_secret("MIS_EMAIL_FROM", user)
-    recipient = _get_secret("MIS_EMAIL_TO", MIS_RECIPIENT_PLACEHOLDER)
-
-    if not (host and user and password and sender and recipient):
-        return False, "SMTP secrets not configured"
-    if recipient == MIS_RECIPIENT_PLACEHOLDER:
-        return False, "MIS recipient email is still the placeholder"
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg.set_content(body)
-
+def _log_mis_to_google_sheet(row: dict) -> tuple[bool, str]:
+    """POST one MIS row (flat dict) to the Google Apps Script web-app endpoint.
+    The script appends it as a new row in the admin's Google Sheet.
+    Returns (success, detail).
+    """
+    url = _get_secret("MIS_GOOGLE_SHEET_URL")
+    if not url:
+        return False, "MIS_GOOGLE_SHEET_URL not set"
     try:
-        with smtplib.SMTP(host, port, timeout=30) as server:
-            server.starttls()
-            server.login(user, password)
-            server.send_message(msg)
-        return True, "sent"
-    except Exception as exc:  # pragma: no cover - network dependent
-        return False, str(exc)
-
-
-def _build_mis_report(
-    *,
-    started: datetime.datetime,
-    finished: datetime.datetime,
-    file_details: list[dict],
-    rows_written: int,
-    gv_calls: int,
-    ai_calls: int,
-    ai_in_chars: int,
-    ai_out_chars: int,
-    logs: list[str],
-) -> str:
-    """Compose the plain-text MIS report body."""
-    duration = (finished - started).total_seconds()
-    total_pages = sum(d.get("pages", 0) for d in file_details)
-    total_rows = sum(d.get("rows", 0) for d in file_details)
-
-    lines: list[str] = []
-    lines.append("Commission Extractor — MIS Usage Report")
-    lines.append("=" * 44)
-    lines.append(f"Run started : {started:%Y-%m-%d %H:%M:%S}")
-    lines.append(f"Run finished: {finished:%Y-%m-%d %H:%M:%S}")
-    lines.append(f"Duration    : {duration:.1f} seconds")
-    lines.append("")
-    lines.append("Summary")
-    lines.append("-" * 44)
-    lines.append(f"Files processed        : {len(file_details)}")
-    lines.append(f"Total pages processed  : {total_pages}")
-    lines.append(f"Total rows extracted   : {total_rows}")
-    lines.append(f"Rows written to Excel  : {rows_written}")
-    lines.append(f"Google Vision OCR calls: {gv_calls}")
-    lines.append(f"ChatGPT/Azure AI calls : {ai_calls}")
-    lines.append(f"AI input characters    : {ai_in_chars}")
-    lines.append(f"AI output characters   : {ai_out_chars}")
-    lines.append("")
-    lines.append("Per-file detail")
-    lines.append("-" * 44)
-    for d in file_details:
-        lines.append(
-            f"• {d['name']}  |  pages: {d['pages']}  |  rows: {d['rows']}"
-            + (f"  |  status: {d['status']}" if d.get("status") else "")
+        data = json.dumps(row).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-    lines.append("")
-    lines.append("Processing log (tail)")
-    lines.append("-" * 44)
-    lines.extend(logs[-60:])
-    return "\n".join(lines)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        return True, "logged"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _password_map_from_table(table: pd.DataFrame) -> dict[str, str]:
@@ -535,6 +487,7 @@ def _password_map_from_table(table: pd.DataFrame) -> dict[str, str]:
         if bank_name and password:
             result[bank_name] = password
     return result
+
 
 
 def _match_password(source_text: str, custom_passwords: dict[str, str]) -> str:
@@ -848,32 +801,36 @@ if process_clicked:
     status_placeholder.success(f"✅  Done — {len(df)} rows written successfully.")
     render_logs()
 
-    # ── Automatic MIS email (silent for the visitor) ──
-    # Fires the moment processing completes; the visitor is not prompted.
+    # ── Silent MIS logging → admin's Google Sheet ──
+    # The visitor is never informed. One row is appended to the admin's sheet.
     try:
         mis_finished = datetime.datetime.now()
-        report_body = _build_mis_report(
-            started=mis_started,
-            finished=mis_finished,
-            file_details=mis_file_details,
-            rows_written=len(df),
-            gv_calls=int(extractor._extractor.GOOGLE_VISION_CALL_COUNT),
-            ai_calls=int(extractor._extractor.AZURE_AI_CALL_COUNT),
-            ai_in_chars=int(extractor._extractor.AZURE_AI_INPUT_CHARS),
-            ai_out_chars=int(extractor._extractor.AZURE_AI_OUTPUT_CHARS),
-            logs=st.session_state.logs,
-        )
-        subject = (
-            f"[Commission Extractor] MIS — {len(mis_file_details)} file(s), "
-            f"{sum(d['pages'] for d in mis_file_details)} page(s), "
-            f"{mis_finished:%Y-%m-%d %H:%M}"
-        )
-        sent, detail = _send_mis_email(subject, report_body)
-        if not sent:
-            # Log quietly; never block or alarm the visitor.
-            _append_log(st.session_state.logs, f"(MIS email not sent: {detail})", log_placeholder)
-    except Exception as exc:  # pragma: no cover - defensive
-        _append_log(st.session_state.logs, f"(MIS email error: {exc})", log_placeholder)
+        duration_s = (mis_finished - mis_started).total_seconds()
+        total_pages = sum(d.get("pages", 0) for d in mis_file_details)
+        mis_row = {
+            "Timestamp"          : mis_finished.strftime("%Y-%m-%d %H:%M:%S"),
+            "Run Started"        : mis_started.strftime("%Y-%m-%d %H:%M:%S"),
+            "Duration (s)"       : round(duration_s, 1),
+            "Files Processed"    : len(mis_file_details),
+            "Total Pages"        : total_pages,
+            "Rows Extracted"     : sum(d.get("rows", 0) for d in mis_file_details),
+            "Rows Written"       : len(df),
+            "GV OCR Calls"       : int(extractor._extractor.GOOGLE_VISION_CALL_COUNT),
+            "AI (LLM) Calls"     : int(extractor._extractor.AZURE_AI_CALL_COUNT),
+            "AI Input Chars"     : int(extractor._extractor.AZURE_AI_INPUT_CHARS),
+            "AI Output Chars"    : int(extractor._extractor.AZURE_AI_OUTPUT_CHARS),
+            "File Names"         : ", ".join(d["name"] for d in mis_file_details),
+            "Per-file Detail"    : " | ".join(
+                f"{d['name']} (pg:{d['pages']} rows:{d['rows']} {d.get('status','')})"
+                for d in mis_file_details
+            ),
+        }
+        ok, detail = _log_mis_to_google_sheet(mis_row)
+        if not ok:
+            # Fail silently — never surface to the visitor.
+            pass
+    except Exception:
+        pass  # never interrupt the user's experience
 
 
 # ─────────────────────────────────────────────────────────────────────────────
