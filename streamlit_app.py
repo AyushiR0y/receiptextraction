@@ -372,7 +372,7 @@ details > div {{
 </style>
 """, unsafe_allow_html=True)
 
-SUPPORTED_TYPES = ["pdf", "jpg", "jpeg", "png", "zip", "xlsx", "xlsm", "xlsb", "xls"]
+SUPPORTED_TYPES = ["pdf", "jpg", "jpeg", "png", "zip", "doc", "docx"]
 
 
 def _default_password_table() -> pd.DataFrame:
@@ -391,13 +391,36 @@ def _normalize_uploaded_name(name: str) -> Path:
 
 
 def _stage_uploaded_files(uploaded_files, staging_dir: Path) -> list[Path]:
+    """Write uploaded files to a temp directory, automatically expanding ZIPs."""
+    import zipfile
     staged: list[Path] = []
     for index, uploaded in enumerate(uploaded_files, start=1):
         relative_name = _normalize_uploaded_name(uploaded.name)
         target = staging_dir / f"upload_{index}" / relative_name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(uploaded.getbuffer())
-        staged.append(target)
+        raw = uploaded.getbuffer()
+        target.write_bytes(raw)
+
+        # Expand ZIP archives — add the contents, not the ZIP itself.
+        if target.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(target, "r") as zf:
+                    extract_dir = target.parent / target.stem
+                    extract_dir.mkdir(parents=True, exist_ok=True)
+                    zf.extractall(extract_dir)
+                    for member in zf.infolist():
+                        if member.is_dir():
+                            continue
+                        extracted = extract_dir / member.filename
+                        if extracted.suffix.lower() in {
+                            ".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx"
+                        }:
+                            staged.append(extracted)
+            except Exception:
+                # If unzipping fails, fall back to treating it as a regular file.
+                staged.append(target)
+        else:
+            staged.append(target)
     return staged
 
 
@@ -520,7 +543,7 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="tip-banner">
-    💡 <strong>Tip:</strong>&nbsp;Do not close the tab when running. Folder upload works directly in the browser. The local path field only works when running the app on your own machine.
+    💡 <strong>Tip:</strong>&nbsp;Upload individual files, a whole folder, or a ZIP archive — all at once. ZIPs are unpacked automatically.
 </div>
 """, unsafe_allow_html=True)
 
@@ -535,31 +558,11 @@ with st.form("processing_form"):
         st.markdown('<div class="sec-header">📂 File inputs</div>', unsafe_allow_html=True)
 
         uploaded_files = st.file_uploader(
-            "Upload files or folder",
+            "Upload files, folder, or ZIP",
             key="uploaded_files",
-            accept_multiple_files="directory",
+            accept_multiple_files=True,
             type=SUPPORTED_TYPES,
-            help="Pick multiple files or a whole folder.",
-        )
-
-        st.markdown("<div style='height:0.65rem'></div>", unsafe_allow_html=True)
-
-        local_folder = st.text_input(
-            "Local folder path (local app only)",
-            key="local_folder",
-            value="",
-            placeholder=r"C:\Users\Ayushi.Roy01\Documents\commission\extracted_invoices",
-            help="Only works when Streamlit runs on your computer.",
-        )
-
-        st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
-
-        pdf_password = st.text_input(
-            "PDF password override (optional)",
-            key="pdf_password",
-            value="",
-            type="password",
-            help="Applies to all files. Leave blank to use bank-specific passwords below.",
+            help="Select individual PDFs/images, a whole folder, or ZIP archives. ZIPs are unpacked automatically.",
         )
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -599,56 +602,35 @@ with st.form("processing_form"):
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BANK PASSWORDS + STATS ROW
+# SUPPORTED FORMATS STRIP
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-pwd_col, stat_col = st.columns([1.2, 0.8], gap="large")
-
-with pwd_col:
-    with st.expander("🔐 Bank passwords", expanded=False):
-        st.caption("Edit or add bank/password pairs. Matching runs against the file path or filename.")
-
-        password_table = st.data_editor(
-            _default_password_table(),
-            use_container_width=True,
-            num_rows="dynamic",
-            hide_index=True,
-            column_config={
-                "Bank Name": st.column_config.TextColumn("Bank Name", width="large"),
-                "Password":  st.column_config.TextColumn("Password",  width="medium"),
-            },
-            key="password_table_editor",
-        )
-
-with stat_col:
-    with st.expander("📊 Supported formats", expanded=False):
-        st.markdown("""
-        <div class="stats-row">
-            <div class="stat-chip"><span class="val">PDF</span><span class="lbl">Encrypted &amp; plain</span></div>
-            <div class="stat-chip"><span class="val">XLS·X</span><span class="lbl">Excel sheets</span></div>
-            <div class="stat-chip"><span class="val">IMG</span><span class="lbl">JPG / PNG</span></div>
-            <div class="stat-chip"><span class="val">ZIP</span><span class="lbl">Bulk archives</span></div>
+with st.expander("� Supported formats & output features", expanded=False):
+    st.markdown("""
+    <div class="stats-row">
+        <div class="stat-chip"><span class="val">PDF</span><span class="lbl">Encrypted &amp; plain</span></div>
+        <div class="stat-chip"><span class="val">IMG</span><span class="lbl">JPG / PNG</span></div>
+        <div class="stat-chip"><span class="val">ZIP</span><span class="lbl">Auto-unpacked</span></div>
+        <div class="stat-chip"><span class="val">DOC</span><span class="lbl">Word documents</span></div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    st.markdown("""
+    <div class="step-list">
+        <div class="step-item">
+            <div class="step-num" style="background:#1DA462">✓</div>
+            <div class="step-text">Duplicate receipts removed automatically</div>
         </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="sec-header">✅ Output features</div>', unsafe_allow_html=True)
-        st.markdown("""
-        <div class="step-list">
-            <div class="step-item">
-                <div class="step-num" style="background:#1DA462">✓</div>
-                <div class="step-text">Duplicate receipts removed automatically</div>
-            </div>
-            <div class="step-item">
-                <div class="step-num" style="background:#1DA462">✓</div>
-                <div class="step-text">Agent codes mapped from master list</div>
-            </div>
-            <div class="step-item">
-                <div class="step-num" style="background:#1DA462">✓</div>
-                <div class="step-text">Single-click Excel download</div>
-            </div>
+        <div class="step-item">
+            <div class="step-num" style="background:#1DA462">✓</div>
+            <div class="step-text">Agent codes mapped from master list</div>
         </div>
-        """, unsafe_allow_html=True)
+        <div class="step-item">
+            <div class="step-num" style="background:#1DA462">✓</div>
+            <div class="step-text">Single-click Excel download</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
@@ -679,34 +661,19 @@ render_logs()
 if process_clicked:
     st.session_state.logs = []
     render_logs()
-    custom_passwords = _password_map_from_table(password_table)
 
     uploaded_files = st.session_state.get("uploaded_files") or []
-    local_folder   = st.session_state.get("local_folder", "") or ""
-    pdf_password   = st.session_state.get("pdf_password", "") or ""
 
     input_paths: list[Path] = []
     staged_root = Path(tempfile.mkdtemp(prefix="commission_streamlit_"))
 
-    if local_folder.strip():
-        folder_path = Path(local_folder.strip())
-        if not folder_path.exists():
-            st.error(f"Folder does not exist: {folder_path}. If this is Streamlit Cloud, use folder upload instead.")
-            st.stop()
-        if not folder_path.is_dir():
-            st.error(f"Path is not a folder: {folder_path}")
-            st.stop()
-        folder_candidates = list(extractor.find_candidate_files(folder_path))
-        input_paths.extend(folder_candidates)
-        _append_log(st.session_state.logs, f"Discovered {len(folder_candidates)} files in folder: {folder_path}", log_placeholder)
-
     if uploaded_files:
         staged_files = _stage_uploaded_files(uploaded_files, staged_root)
         input_paths.extend(staged_files)
-        _append_log(st.session_state.logs, f"Staged {len(staged_files)} uploaded file(s).", log_placeholder)
+        _append_log(st.session_state.logs, f"Staged {len(staged_files)} file(s) (ZIPs unpacked).", log_placeholder)
 
     if not input_paths:
-        st.warning("Add a folder path or upload at least one file before processing.")
+        st.warning("Upload at least one file before processing.")
         st.stop()
 
     unique_inputs: list[Path] = []
@@ -739,7 +706,7 @@ if process_clicked:
         file_rows = 0
         file_status = ""
         try:
-            password_override = pdf_password.strip() if pdf_password.strip() else _match_password(str(file_path), custom_passwords)
+            password_override = _match_password(str(file_path), extractor.BANK_PASSWORDS)
             rows = extractor.process_path(file_path, override_password=password_override or None)
             if rows:
                 all_rows.extend(rows)
