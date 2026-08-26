@@ -46,6 +46,7 @@ poppler-*/
 verify_fix.py
 inspect_tax_invoice_text.py
 test_agent_mapping.py
+secrets.toml.example
 
 # Logs and runtime caches (not needed for execution)
 *.log
