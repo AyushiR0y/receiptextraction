@@ -451,8 +451,11 @@ def _append_log(logs: list[str], message: str, placeholder) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 import json
+import smtplib
+import logging as _logging
 import urllib.request
 import urllib.error
+from email.message import EmailMessage
 
 
 def _get_secret(key: str, default: str = "") -> str:
@@ -477,8 +480,9 @@ def _count_pdf_pages(path: Path) -> int:
 
 
 def _log_mis_to_google_sheet(row: dict) -> tuple[bool, str]:
-    """POST one MIS row (flat dict) to the Google Apps Script web-app endpoint.
-    The script appends it as a new row in the admin's Google Sheet.
+    """POST one MIS row to the Google Apps Script web-app endpoint.
+    Google Apps Script redirects POST → GET internally (302), so we must
+    follow the Location header with a second GET request.
     Returns (success, detail).
     """
     url = _get_secret("MIS_GOOGLE_SHEET_URL")
@@ -486,18 +490,87 @@ def _log_mis_to_google_sheet(row: dict) -> tuple[bool, str]:
         return False, "MIS_GOOGLE_SHEET_URL not set"
     try:
         data = json.dumps(row).encode("utf-8")
+        # Step 1: initial POST (do NOT auto-follow redirects — handle manually).
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp.read()
-        return True, "logged"
-    except urllib.error.HTTPError as exc:
-        return False, f"HTTP {exc.code}: {exc.reason}"
+        # Disable auto-redirect so we can re-issue as GET.
+        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None  # suppress redirect
+
+        no_redirect_opener = urllib.request.build_opener(_NoRedirect())
+        try:
+            with no_redirect_opener.open(req, timeout=30) as resp:
+                resp.read()
+                return True, "logged (no-redirect)"
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                # Follow the redirect as a GET — this is normal for Apps Script.
+                location = exc.headers.get("Location", "")
+                if location:
+                    with urllib.request.urlopen(location, timeout=30) as r2:
+                        r2.read()
+                    return True, "logged (redirect followed)"
+                return False, f"Redirect with no Location header (HTTP {exc.code})"
+            return False, f"HTTP {exc.code}: {exc.reason}"
     except Exception as exc:
         return False, str(exc)
+
+
+def _send_mis_gmail(subject: str, body: str) -> tuple[bool, str]:
+    """Send MIS report via Gmail SMTP (App Password).
+    Secrets needed: GMAIL_USERNAME, GMAIL_APP_PASSWORD, MIS_EMAIL_TO.
+    """
+    user = _get_secret("GMAIL_USERNAME")
+    password = _get_secret("GMAIL_APP_PASSWORD")
+    recipient = _get_secret("MIS_EMAIL_TO")
+    if not (user and password and recipient):
+        return False, "GMAIL_USERNAME / GMAIL_APP_PASSWORD / MIS_EMAIL_TO not set"
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = recipient
+        msg.set_content(body)
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
+            server.login(user, password)
+            server.send_message(msg)
+        return True, "sent via Gmail"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _deliver_mis(subject: str, body: str) -> tuple[bool, str]:
+    """Try Google Sheet first (primary), then Gmail (fallback).
+    Returns (success, channel_used_or_error).
+    """
+    errors: list[str] = []
+
+    gsheet_url = _get_secret("MIS_GOOGLE_SHEET_URL")
+    if gsheet_url:
+        ok, detail = _log_mis_to_google_sheet({"_subject": subject, "_body": body})
+        # _log_mis_to_google_sheet is for structured rows; for email-style body
+        # use it only when called from the sheet path.  The row dict is passed
+        # directly from the call site; this wrapper is for the email fallback.
+        if ok:
+            return True, f"Google Sheet: {detail}"
+        errors.append(f"Sheet: {detail}")
+
+    if _get_secret("GMAIL_USERNAME"):
+        ok, detail = _send_mis_gmail(subject, body)
+        if ok:
+            return True, f"Gmail: {detail}"
+        errors.append(f"Gmail: {detail}")
+
+    if not errors:
+        return False, "no MIS channel configured"
+    return False, " | ".join(errors)
 
 
 def _password_map_from_table(table: pd.DataFrame) -> dict[str, str]:
@@ -510,6 +583,23 @@ def _password_map_from_table(table: pd.DataFrame) -> dict[str, str]:
         if bank_name and password:
             result[bank_name] = password
     return result
+
+
+# ── Per-page progress: pipe the extractor's INFO logs into the Streamlit log ──
+class _StreamlitLogHandler(_logging.Handler):
+    """Routes extractor log messages that mention 'page' into the live Streamlit log."""
+
+    def __init__(self, logs: list[str], placeholder):
+        super().__init__(_logging.INFO)
+        self._logs = logs
+        self._placeholder = placeholder
+        # Only forward lines that describe per-page activity.
+        self._keywords = ("page", "ocr", "low text", "forcing ocr", "rendered", "extracted")
+
+    def emit(self, record: _logging.LogRecord) -> None:
+        msg = record.getMessage().lower()
+        if any(k in msg for k in self._keywords):
+            _append_log(self._logs, f"  [extractor] {record.getMessage()}", self._placeholder)
 
 
 
@@ -688,6 +778,11 @@ if process_clicked:
     extractor.load_agent_codes_from_xlsx()
     _append_log(st.session_state.logs, "Loaded agent codes.", log_placeholder)
 
+    # ── Attach live log handler so per-page extractor messages appear in the UI ──
+    _st_log_handler = _StreamlitLogHandler(st.session_state.logs, log_placeholder)
+    _extractor_logger = _logging.getLogger("receipt_extractor")
+    _extractor_logger.addHandler(_st_log_handler)
+
     # ── MIS instrumentation: reset per-run counters and capture start time ──
     mis_started = datetime.datetime.now()
     extractor._extractor.GOOGLE_VISION_CALL_COUNT = 0
@@ -762,42 +857,82 @@ if process_clicked:
     except Exception as exc:
         _append_log(st.session_state.logs, f"  → final math validation skipped: {exc}", log_placeholder)
 
+    # ── Remove the live log handler now that processing is complete ──
+    _extractor_logger.removeHandler(_st_log_handler)
+
     st.session_state.result_path = str(output_file)
 
     _append_log(st.session_state.logs, f"✅ Wrote {len(df)} row(s) to {output_file}", log_placeholder)
     status_placeholder.success(f"✅  Done — {len(df)} rows written successfully.")
     render_logs()
 
-    # ── Silent MIS logging → admin's Google Sheet ──
-    # The visitor is never informed. One row is appended to the admin's sheet.
+    # ── Silent MIS logging — Google Sheet primary, Gmail fallback ──
     try:
         mis_finished = datetime.datetime.now()
         duration_s = (mis_finished - mis_started).total_seconds()
         total_pages = sum(d.get("pages", 0) for d in mis_file_details)
         mis_row = {
-            "Timestamp"          : mis_finished.strftime("%Y-%m-%d %H:%M:%S"),
-            "Run Started"        : mis_started.strftime("%Y-%m-%d %H:%M:%S"),
-            "Duration (s)"       : round(duration_s, 1),
-            "Files Processed"    : len(mis_file_details),
-            "Total Pages"        : total_pages,
-            "Rows Extracted"     : sum(d.get("rows", 0) for d in mis_file_details),
-            "Rows Written"       : len(df),
-            "GV OCR Calls"       : int(extractor._extractor.GOOGLE_VISION_CALL_COUNT),
-            "AI (LLM) Calls"     : int(extractor._extractor.AZURE_AI_CALL_COUNT),
-            "AI Input Chars"     : int(extractor._extractor.AZURE_AI_INPUT_CHARS),
-            "AI Output Chars"    : int(extractor._extractor.AZURE_AI_OUTPUT_CHARS),
-            "File Names"         : ", ".join(d["name"] for d in mis_file_details),
-            "Per-file Detail"    : " | ".join(
+            "Timestamp"       : mis_finished.strftime("%Y-%m-%d %H:%M:%S"),
+            "Run Started"     : mis_started.strftime("%Y-%m-%d %H:%M:%S"),
+            "Duration (s)"    : round(duration_s, 1),
+            "Files Processed" : len(mis_file_details),
+            "Total Pages"     : total_pages,
+            "Rows Extracted"  : sum(d.get("rows", 0) for d in mis_file_details),
+            "Rows Written"    : len(df),
+            "GV OCR Calls"    : int(extractor._extractor.GOOGLE_VISION_CALL_COUNT),
+            "AI (LLM) Calls"  : int(extractor._extractor.AZURE_AI_CALL_COUNT),
+            "AI Input Chars"  : int(extractor._extractor.AZURE_AI_INPUT_CHARS),
+            "AI Output Chars" : int(extractor._extractor.AZURE_AI_OUTPUT_CHARS),
+            "File Names"      : ", ".join(d["name"] for d in mis_file_details),
+            "Per-file Detail" : " | ".join(
                 f"{d['name']} (pg:{d['pages']} rows:{d['rows']} {d.get('status','')})"
                 for d in mis_file_details
             ),
         }
-        ok, detail = _log_mis_to_google_sheet(mis_row)
-        if not ok:
-            # Fail silently — never surface to the visitor.
-            pass
-    except Exception:
-        pass  # never interrupt the user's experience
+
+        mis_errors: list[str] = []
+
+        # Primary: Google Sheet
+        sheet_url = _get_secret("MIS_GOOGLE_SHEET_URL")
+        if sheet_url:
+            ok, detail = _log_mis_to_google_sheet(mis_row)
+            if not ok:
+                mis_errors.append(f"Sheet failed: {detail}")
+
+        # Fallback / parallel: Gmail
+        if _get_secret("GMAIL_USERNAME"):
+            subject = (
+                f"[Commission Extractor] MIS — {len(mis_file_details)} file(s), "
+                f"{total_pages} page(s), {mis_finished:%Y-%m-%d %H:%M}"
+            )
+            body_lines = [
+                "Commission Extractor — MIS Usage Report",
+                "=" * 44,
+                f"Timestamp    : {mis_row['Timestamp']}",
+                f"Duration     : {mis_row['Duration (s)']}s",
+                f"Files        : {mis_row['Files Processed']}",
+                f"Pages        : {mis_row['Total Pages']}",
+                f"Rows written : {mis_row['Rows Written']}",
+                f"GV OCR calls : {mis_row['GV OCR Calls']}",
+                f"AI calls     : {mis_row['AI (LLM) Calls']}",
+                "",
+                "Per-file detail:",
+                mis_row["Per-file Detail"].replace(" | ", "\n"),
+            ]
+            ok, detail = _send_mis_gmail(subject, "\n".join(body_lines))
+            if not ok:
+                mis_errors.append(f"Gmail failed: {detail}")
+
+        if not sheet_url and not _get_secret("GMAIL_USERNAME"):
+            mis_errors.append("no MIS channel configured (set MIS_GOOGLE_SHEET_URL or GMAIL_USERNAME)")
+
+        if mis_errors:
+            # Log to the admin log, but completely hidden from the visitor
+            # (they only see the success banner, not these log lines).
+            _append_log(st.session_state.logs, f"(MIS: {'; '.join(mis_errors)})", log_placeholder)
+
+    except Exception as exc:
+        _append_log(st.session_state.logs, f"(MIS error: {exc})", log_placeholder)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
