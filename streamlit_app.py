@@ -787,7 +787,8 @@ if process_clicked:
     _extractor_logger.addHandler(_st_log_handler)
 
     # ── MIS instrumentation: reset per-run counters and capture start time ──
-    mis_started = datetime.datetime.now()
+    _IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    mis_started = datetime.datetime.now(_IST_TZ)
     extractor._extractor.GOOGLE_VISION_CALL_COUNT = 0
     extractor._extractor.AZURE_AI_CALL_COUNT = 0
     extractor._extractor.AZURE_AI_INPUT_CHARS = 0
@@ -873,12 +874,14 @@ if process_clicked:
 
     # ── Silent MIS logging — Google Sheet primary, Gmail fallback ──
     try:
-        mis_finished = datetime.datetime.now()
+        _IST = _IST_TZ
+        mis_finished = datetime.datetime.now(_IST)
         duration_s = (mis_finished - mis_started).total_seconds()
         total_pages = sum(d.get("pages", 0) for d in mis_file_details)
+        _DT_FMT = "%d %m %Y %I:%M:%S %p IST"
         mis_row = {
-            "Timestamp"       : mis_finished.strftime("%Y-%m-%d %H:%M:%S"),
-            "Run Started"     : mis_started.strftime("%Y-%m-%d %H:%M:%S"),
+            "Timestamp"       : mis_finished.strftime(_DT_FMT),
+            "Run Started"     : mis_started.strftime(_DT_FMT),
             "Duration (s)"    : round(duration_s, 1),
             "Files Processed" : len(mis_file_details),
             "Total Pages"     : total_pages,
