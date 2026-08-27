@@ -525,23 +525,26 @@ def _log_mis_to_google_sheet(row: dict) -> tuple[bool, str]:
 def _send_mis_gmail(subject: str, body: str) -> tuple[bool, str]:
     """Send MIS report via Gmail SMTP (App Password).
     Secrets needed: GMAIL_USERNAME, GMAIL_APP_PASSWORD, MIS_EMAIL_TO.
+    MIS_EMAIL_TO may be a comma-separated list of addresses.
     """
     user = _get_secret("GMAIL_USERNAME")
     password = _get_secret("GMAIL_APP_PASSWORD")
-    recipient = _get_secret("MIS_EMAIL_TO")
-    if not (user and password and recipient):
+    recipient_raw = _get_secret("MIS_EMAIL_TO")
+    if not (user and password and recipient_raw):
         return False, "GMAIL_USERNAME / GMAIL_APP_PASSWORD / MIS_EMAIL_TO not set"
+    # Support multiple recipients separated by commas.
+    recipients = [r.strip() for r in recipient_raw.split(",") if r.strip()]
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = user
-        msg["To"] = recipient
+        msg["To"] = ", ".join(recipients)
         msg.set_content(body)
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
             server.starttls()
             server.login(user, password)
             server.send_message(msg)
-        return True, "sent via Gmail"
+        return True, f"sent via Gmail to {len(recipients)} recipient(s)"
     except Exception as exc:
         return False, str(exc)
 
@@ -846,8 +849,10 @@ if process_clicked:
 
     # Final safety net: re-validate the written workbook so no "Math Valid = YES"
     # row is a false positive (corrects the file in place if needed).
+    # use_ai=False because revalidate_rows_math already ran the AI check above
+    # on the same rows — calling it again on the Excel would be a duplicate AI call.
     try:
-        summary = extractor.validate_excel_math(output_file)
+        summary = extractor.validate_excel_math(output_file, use_ai=False)
         if summary.get("downgraded"):
             _append_log(
                 st.session_state.logs,
@@ -890,6 +895,15 @@ if process_clicked:
             ),
         }
 
+        # ── Estimated cost (GPT-4o-mini pricing: $0.15/1M input, $0.60/1M output tokens)
+        # 1 token ≈ 4 characters.  1 USD ≈ 84 INR
+        _USD_TO_INR    = 84
+        _ai_in_tokens  = mis_row["AI Input Chars"]  / 4
+        _ai_out_tokens = mis_row["AI Output Chars"] / 4
+        _est_cost_usd  = (_ai_in_tokens * 0.15 + _ai_out_tokens * 0.60) / 1_000_000
+        _est_cost_inr  = _est_cost_usd * _USD_TO_INR
+        mis_row["Est. AI Cost (INR)"] = f"₹{_est_cost_inr:.4f}"
+
         mis_errors: list[str] = []
 
         # Primary: Google Sheet
@@ -899,7 +913,7 @@ if process_clicked:
             if not ok:
                 mis_errors.append(f"Sheet failed: {detail}")
 
-        # Fallback / parallel: Gmail
+        # Fallback / parallel: Gmail (MIS_EMAIL_TO supports comma-separated list)
         if _get_secret("GMAIL_USERNAME"):
             subject = (
                 f"[Commission Extractor] MIS — {len(mis_file_details)} file(s), "
@@ -915,6 +929,9 @@ if process_clicked:
                 f"Rows written : {mis_row['Rows Written']}",
                 f"GV OCR calls : {mis_row['GV OCR Calls']}",
                 f"AI calls     : {mis_row['AI (LLM) Calls']}",
+                f"AI in tokens : ~{int(_ai_in_tokens)}",
+                f"AI out tokens: ~{int(_ai_out_tokens)}",
+                f"Est. AI cost : {mis_row['Est. AI Cost (INR)']}  (GPT-4o-mini rates, 1 USD ≈ 84 INR)",
                 "",
                 "Per-file detail:",
                 mis_row["Per-file Detail"].replace(" | ", "\n"),
@@ -927,8 +944,6 @@ if process_clicked:
             mis_errors.append("no MIS channel configured (set MIS_GOOGLE_SHEET_URL or GMAIL_USERNAME)")
 
         if mis_errors:
-            # Log to the admin log, but completely hidden from the visitor
-            # (they only see the success banner, not these log lines).
             _append_log(st.session_state.logs, f"(MIS: {'; '.join(mis_errors)})", log_placeholder)
 
     except Exception as exc:

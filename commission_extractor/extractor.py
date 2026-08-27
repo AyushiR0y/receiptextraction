@@ -1714,18 +1714,6 @@ def clean_amount(value: str) -> str:
     match = re.search(r"-?\d+(?:\.\d{1,2})?", value)
     return match.group(0) if match else ""
 
-def validate_and_correct_taxes(
-    taxable_amount: str, cgst: str, sgst: str, utgst: str, igst: str
-) -> Tuple[str, str, str, str, str]:
-    """
-    Sanity check tax amounts without mutating extracted values.
-    Expected rates: CGST @ 9%, SGST @ 9%, IGST @ 18%.
-    Returns original values so downstream validation can flag suspicious rows.
-    """
-    return cgst, sgst, utgst, igst
-
-
-
 INDIAN_STATES = [
     "Andhra Pradesh",
     "ARUNACHAL PRADESH",
@@ -4107,63 +4095,6 @@ def ocr_image_with_google_vision(image: Image.Image) -> str:
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         LOGGER.warning("Google Vision OCR failed: %s", exc)
         return ""
-
-
-def probe_google_vision_api(image: Image.Image) -> Dict[str, str]:
-    """Run the Google Vision request once and return a structured diagnostic payload.
-
-    This is useful for distinguishing API/auth problems from OCR parsing issues.
-    """
-    api_key = get_google_vision_api_key()
-    result: Dict[str, str] = {"ok": "false", "status": "no_api_key", "text": "", "error": ""}
-    if not api_key:
-        result["error"] = "GOOGLE_VISION_API_KEY is not configured"
-        return result
-
-    try:
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        content = base64.b64encode(buffer.getvalue()).decode("ascii")
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": content},
-                    "features": [{"type": "TEXT_DETECTION"}],
-                }
-            ]
-        }
-        request = urllib.request.Request(
-            url=f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-        parsed = json.loads(body)
-        responses = parsed.get("responses", [])
-        first = responses[0] if responses else {}
-        full_text = first.get("fullTextAnnotation", {}).get("text", "") or ""
-        if not full_text:
-            annotations = first.get("textAnnotations", [])
-            if annotations:
-                full_text = annotations[0].get("description", "") or ""
-        result["ok"] = "true"
-        result["status"] = "200"
-        result["text"] = normalize_text(full_text)
-        return result
-    except urllib.error.HTTPError as exc:
-        try:
-            body_text = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            body_text = ""
-        result["status"] = str(exc.code)
-        result["error"] = body_text or str(exc)
-        return result
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
-        result["status"] = "error"
-        result["error"] = str(exc)
-        return result
 
 
 def infer_password_from_name(file_name: str) -> Optional[str]:
@@ -6587,36 +6518,6 @@ def extract_fields(text: str, is_axis_bank: bool = False) -> Dict[str, str]:
         row.setdefault(col, "")
 
     return row
-
-
-def has_meaningful_data(row: Dict[str, str]) -> bool:
-    invoice_ok = is_valid_invoice_no(row.get("Vendor Inv No", ""))
-    date_ok = bool((row.get("Vendor Inv Date", "") or "").strip())
-    amount_ok = False
-    for field in ["Total Inv Amt", "BROKERAGE Amount", "GST TOTAL AMT", "CGST @ 9%", "SGST @ 9%", "IGST"]:
-        val = clean_amount(row.get(field, ""))
-        if not val:
-            continue
-        try:
-            if float(val.replace(",", "")) > 0:
-                amount_ok = True
-                break
-        except (ValueError, AttributeError):
-            continue
-    pan_ok = bool(re.fullmatch(r"[A-Z]{5}[0-9]{4}[A-Z]", (row.get("Agent PAN", "") or "").strip(), re.IGNORECASE))
-    balic_gstn_ok = bool(re.fullmatch(r"[0-9A-Z]{15}", (row.get("BALIC GSTN", "") or "").strip(), re.IGNORECASE))
-    broker_gstn_ok = bool(re.fullmatch(r"[0-9A-Z]{15}", (row.get("BROKER GSTN", "") or "").strip(), re.IGNORECASE))
-    sac_ok = bool(re.fullmatch(r"[0-9]{4,8}", (row.get("SAC Code", "") or "").strip()))
-
-    # Business rule from user: invoice number should always be present.
-    if not invoice_ok:
-        return False
-
-    if invoice_ok and (date_ok or amount_ok or pan_ok or balic_gstn_ok or broker_gstn_ok or sac_ok):
-        return True
-
-    signals = [date_ok, amount_ok, pan_ok, balic_gstn_ok, broker_gstn_ok, sac_ok]
-    return any(signals)
 
 
 def is_actual_receipt_row(fields: Dict[str, str], receipt_text: str) -> bool:
