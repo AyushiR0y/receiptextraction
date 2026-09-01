@@ -74,16 +74,41 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
     -webkit-font-smoothing: antialiased;
 }
 
-/* ── Hide Streamlit chrome ─────────────────────────────────────────────── */
-#MainMenu, footer { visibility: hidden; }
-[data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
-header[data-testid="stHeader"] { background: transparent !important; height: 0 !important; }
+/* ── Hide Streamlit chrome ─────────────────────────────────────────────────
+   Keep the header and toolbar in the DOM: the "expand sidebar" control lives
+   inside them, so hiding either makes a collapsed sidebar impossible to
+   reopen.  Hide only the menu / deploy / status items instead.            */
+footer { visibility: hidden; }
+[data-testid="stDecoration"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stToolbarActions"],
+[data-testid="stMainMenu"], #MainMenu,
+[data-testid="stAppDeployButton"],
+[data-testid="stStatusWidget"] { display: none !important; }
+
+/* Sidebar expand control (appears in the toolbar once the sidebar is closed) */
+[data-testid="stExpandSidebarButton"] {
+    display: inline-flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="stExpandSidebarButton"] button {
+    background: #FFFFFF !important;
+    border: 1px solid rgba(0,94,172,0.20) !important;
+    border-radius: 10px !important;
+    color: #005EAC !important;
+    box-shadow: 0 2px 8px rgba(0,94,172,0.14) !important;
+}
+[data-testid="stExpandSidebarButton"] button:hover {
+    background: #E8F2FC !important;
+    border-color: #005EAC !important;
+}
 
 /* ── Page canvas ───────────────────────────────────────────────────────── */
 [data-testid="stAppViewContainer"] > .main { padding: 0 !important; }
 [data-testid="stMainBlockContainer"], [data-testid="block-container"] {
     max-width: 1120px !important;
-    padding: 3rem 2.4rem 5rem !important;
+    padding: 1.1rem 2.4rem 5rem !important;
     margin: 0 auto !important;
 }
 [data-testid="stVerticalBlock"] { gap: 0.75rem; }
@@ -100,13 +125,29 @@ header[data-testid="stHeader"] { background: transparent !important; height: 0 !
     width: 268px !important;
     min-width: 268px !important;
 }
-[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] { padding: 1.15rem 1.05rem 2rem !important; }
+/* Pull the sidebar content up: Streamlit reserves a tall header strip for the
+   collapse chevron, which pushes the brand block far down the panel. */
+[data-testid="stSidebar"] [data-testid="stSidebarHeader"] {
+    padding: 0.4rem 0.75rem 0 !important;
+    min-height: 0 !important;
+    height: auto !important;
+}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+    padding: 0.15rem 1.05rem 2rem !important;
+}
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.35rem; }
+
+/* Keep the collapse chevron permanently visible, not hover-only */
+[data-testid="stSidebarCollapseButton"] {
+    display: inline-flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
 [data-testid="stSidebarCollapseButton"] button { color: #005EAC !important; }
 
 .sb-brand {
     display: flex; align-items: center; gap: 0.65rem;
-    padding: 0.15rem 0 1.1rem;
+    padding: 0 0 1.1rem;
 }
 .sb-mark {
     width: 42px; height: 42px; border-radius: 13px;
@@ -168,7 +209,21 @@ header[data-testid="stHeader"] { background: transparent !important; height: 0 !
 /* ═══════════════════════════════════════════════════════════════════════
    PAGE TITLE
    ═══════════════════════════════════════════════════════════════════════ */
-.page-head { margin-bottom: 2rem; }
+.page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+}
+.page-head-text { min-width: 0; }
+.page-logo {
+    height: 46px;
+    width: auto;
+    max-width: 210px;
+    object-fit: contain;
+    flex-shrink: 0;
+}
 .page-title {
     display: flex; align-items: center; gap: 0.7rem;
     font-size: 1.85rem; font-weight: 700; letter-spacing: -0.035em; color: #0D1F33;
@@ -502,6 +557,8 @@ header[data-testid="stHeader"] { background: transparent !important; height: 0 !
 
 @media (max-width: 900px) {
     [data-testid="stMainBlockContainer"] { padding: 1rem 1rem 3rem !important; }
+    .page-head { flex-direction: column; align-items: flex-start; gap: 0.9rem; }
+    .page-logo { height: 34px; order: -1; }
     .page-title { font-size: 1.4rem; }
     .stepper { flex-direction: column; align-items: flex-start; gap: 0.75rem; }
     .step-line { display: none; }
@@ -582,6 +639,33 @@ _ICON_PATHS = {
     "receipt":  '<path d="M5 3v18l2-1.4 2 1.4 2-1.4 2 1.4 2-1.4 2 1.4V3l-2 1.4L13 3l-2 1.4L9 3 7 4.4 5 3Z"/>'
                 '<path d="M9 8h6"/><path d="M9 12h6"/>',
 }
+
+
+@st.cache_data(show_spinner=False)
+def _logo_data_uri(max_height: int = 120) -> str:
+    """Return logo.png as a downscaled base64 data URI (empty string if absent).
+
+    Raw HTML cannot reference local files, so the image is inlined.  It is
+    resized first to keep the inlined payload small, and cached so the encode
+    happens once per session rather than on every rerun.
+    """
+    if not _LOGO_PATH.exists():
+        return ""
+    try:
+        import base64
+        import io
+        from PIL import Image
+
+        with Image.open(_LOGO_PATH) as img:
+            img = img.convert("RGBA")
+            if img.height > max_height:
+                scale = max_height / img.height
+                img = img.resize((max(1, round(img.width * scale)), max_height), Image.LANCZOS)
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:
+        return ""
 
 
 def _icon(name: str, size: int = 16, stroke: float = 1.8) -> str:
@@ -888,10 +972,18 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE HEAD
 # ─────────────────────────────────────────────────────────────────────────────
+_logo_uri = _logo_data_uri()
+_logo_html = (
+    f'<img class="page-logo" src="{_logo_uri}" alt="Company logo">' if _logo_uri else ""
+)
+
 st.markdown(f"""
 <div class="page-head">
-    <div class="page-title"><span class="glyph">{_icon("extract", 20)}</span>Commission Extraction</div>
-    <div class="page-sub">Upload your receipts and download a ready-to-use Excel workbook.</div>
+    <div class="page-head-text">
+        <div class="page-title"><span class="glyph">{_icon("extract", 20)}</span>Commission Extraction</div>
+        <div class="page-sub">Upload your receipts and download a ready-to-use Excel workbook.</div>
+    </div>
+    {_logo_html}
 </div>
 """, unsafe_allow_html=True)
 
