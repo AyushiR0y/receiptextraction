@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import html
 import datetime
 import tempfile
 from pathlib import Path
@@ -34,341 +35,477 @@ except Exception:
 
 # ── Brand ──────────────────────────────────────────────────────────────────
 PRIMARY      = "#005EAC"
-PRIMARY_DARK = "#004A8C"
-PRIMARY_SOFT = "#DAF8FF"
+PRIMARY_DARK = "#00447D"
+PRIMARY_SOFT = "#E8F2FC"
 ACCENT       = "#F58220"
 ACCENT_SOFT  = "#FEF0E4"
+SUCCESS      = "#12A150"
 BG           = "#F4F7FC"
 SURFACE      = "#FFFFFF"
 TEXT         = "#0D1F33"
 TEXT_MUTED   = "#5A7492"
-BORDER       = "rgba(0,94,172,0.12)"
-SHADOW       = "rgba(0,94,172,0.08)"
+BORDER       = "rgba(13,31,51,0.09)"
 
+
+_LOGO_PATH = Path(__file__).parent / "logo.png"
 
 st.set_page_config(
     page_title="Commission Extractor",
-    page_icon="💼",
+    page_icon=str(_LOGO_PATH) if _LOGO_PATH.exists() else ":material/receipt_long:",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-st.markdown(f"""
+# ─────────────────────────────────────────────────────────────────────────────
+# DESIGN SYSTEM
+# Plain (non-f) string so CSS braces need no escaping.  Colours are inlined to
+# keep the stylesheet readable; they mirror the brand constants above.
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
 
-*, *::before, *::after {{ box-sizing: border-box; }}
+*, *::before, *::after { box-sizing: border-box; }
 
-html, body, [data-testid="stAppViewContainer"], .stApp {{
-    background: {BG} !important;
-    color: {TEXT} !important;
-    font-family: 'DM Sans', sans-serif !important;
-}}
+html, body, [data-testid="stAppViewContainer"], .stApp {
+    background: #F4F7FC !important;
+    color: #0D1F33 !important;
+    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
+    -webkit-font-smoothing: antialiased;
+}
 
-/* ── Hide Streamlit chrome ── */
-#MainMenu, footer, header {{ visibility: hidden; }}
-[data-testid="stToolbar"] {{ display: none; }}
+/* ── Hide Streamlit chrome ─────────────────────────────────────────────── */
+#MainMenu, footer { visibility: hidden; }
+[data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; height: 0 !important; }
 
-/* ── Main container ── */
-[data-testid="stAppViewContainer"] > .main {{ padding: 2rem 2.5rem 4rem; }}
-[data-testid="block-container"] {{ max-width: 1240px; margin: 0 auto; padding: 0; }}
+/* ── Page canvas ───────────────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"] > .main { padding: 0 !important; }
+[data-testid="stMainBlockContainer"], [data-testid="block-container"] {
+    max-width: 1120px !important;
+    padding: 3rem 2.4rem 5rem !important;
+    margin: 0 auto !important;
+}
+[data-testid="stVerticalBlock"] { gap: 0.75rem; }
 
-/* ── Top nav bar ── */
-.topbar {{
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0 0 1.75rem;
-    border-bottom: 1px solid {BORDER};
-    margin-bottom: 2rem;
-}}
-.topbar-logo {{
-    width: 40px; height: 40px;
-    background: {PRIMARY};
-    border-radius: 10px;
+/* Inline SVG icons (no emoji anywhere in the UI) */
+.ic { flex-shrink: 0; vertical-align: -0.18em; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SIDEBAR
+   ═══════════════════════════════════════════════════════════════════════ */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #E9F2FC 0%, #DCE9F8 100%) !important;
+    border-right: 1px solid rgba(0,94,172,0.14) !important;
+    width: 268px !important;
+    min-width: 268px !important;
+}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] { padding: 1.15rem 1.05rem 2rem !important; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.35rem; }
+[data-testid="stSidebarCollapseButton"] button { color: #005EAC !important; }
+
+.sb-brand {
+    display: flex; align-items: center; gap: 0.65rem;
+    padding: 0.15rem 0 1.1rem;
+}
+.sb-mark {
+    width: 42px; height: 42px; border-radius: 13px;
+    background: linear-gradient(140deg, #0071CE, #00447D);
+    color: #fff; font-weight: 700; font-size: 1.15rem;
     display: flex; align-items: center; justify-content: center;
-    font-size: 1.2rem;
-    box-shadow: 0 4px 12px rgba(0,94,172,0.28);
-}}
-.topbar-title {{
-    font-size: 1.55rem;
-    font-weight: 700;
-    color: {TEXT};
+    box-shadow: 0 6px 16px rgba(0,68,125,0.30);
     letter-spacing: -0.02em;
-}}
-.topbar-sub {{
-    font-size: 0.95rem;
-    color: {TEXT_MUTED};
-    font-weight: 400;
-}}
-.topbar-badge {{
-    margin-left: auto;
-    background: {PRIMARY_SOFT};
-    color: {PRIMARY};
-    font-size: 0.72rem;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    padding: 0.3rem 0.75rem;
-    border-radius: 999px;
-    border: 1px solid rgba(0,94,172,0.18);
-}}
+}
+.sb-brand-name { font-size: 0.95rem; font-weight: 700; letter-spacing: -0.02em; color: #0D1F33; line-height: 1.15; }
+.sb-brand-sub  { font-size: 0.68rem; color: #5A7492; font-weight: 500; letter-spacing: 0.02em; }
 
-/* ── Section headers ── */
-.sec-header {{
-    font-size: 1.05rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    color: {PRIMARY};
-    margin-bottom: 0.55rem;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-}}
+.sb-label {
+    font-size: 0.63rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.11em; color: #6E8CAB;
+    margin: 1.05rem 0 0.5rem;
+}
 
-/* ── Card ── */
-.card {{
-    background: transparent;
-    border: 0;
-    border-radius: 0;
-    padding: 1rem 0 1rem;
-    box-shadow: none;
-    margin-bottom: 0.9rem;
-}}
-
-.section-divider {{
-    height: 1px;
-    background: rgba(0,94,172,0.14);
-    margin: 0.75rem 0 1.25rem;
-}}
-
-/* ── Stat chips in hero ── */
-.stats-row {{
-    display: flex;
-    gap: 0.75rem;
-    margin-top: 1.1rem;
-    flex-wrap: wrap;
-}}
-.stat-chip {{
-    background: {PRIMARY_SOFT};
-    border: 1px solid rgba(0,94,172,0.15);
+.sb-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+.sb-metric {
+    background: rgba(255,255,255,0.78);
+    border: 1px solid rgba(0,94,172,0.13);
     border-radius: 12px;
-    padding: 0.5rem 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-}}
-.stat-chip .val {{
-    font-size: 1.15rem;
-    font-weight: 700;
-    color: {PRIMARY};
-    line-height: 1;
-}}
-.stat-chip .lbl {{
-    font-size: 0.64rem;
-    color: {TEXT_MUTED};
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}}
+    padding: 0.55rem 0.65rem;
+}
+.sb-metric .v { font-size: 1.22rem; font-weight: 700; color: #00447D; line-height: 1.05; letter-spacing: -0.03em; }
+.sb-metric .k { font-size: 0.6rem; font-weight: 600; color: #6E8CAB; text-transform: uppercase; letter-spacing: 0.07em; margin-top: 0.12rem; }
 
-/* ── Tip banner ── */
-.tip-banner {{
-    background: {ACCENT_SOFT};
-    border: 1px solid rgba(245,130,32,0.2);
-    border-radius: 12px;
-    padding: 0.65rem 1rem;
-    font-size: 0.84rem;
-    color: #8B4A0A;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 1.25rem;
-}}
+.sb-empty {
+    border: 1px dashed rgba(0,94,172,0.28);
+    border-radius: 14px;
+    background: rgba(255,255,255,0.45);
+    padding: 1.7rem 0.9rem;
+    text-align: center;
+}
+.sb-empty .ico { color: #8CA9C4; }
+.sb-empty .t   { font-size: 0.8rem; font-weight: 600; color: #4A688B; margin-top: 0.5rem; }
+.sb-empty .s   { font-size: 0.68rem; color: #7C97B3; margin-top: 0.2rem; }
 
-/* ── Step indicators ── */
-.step-list {{
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-    padding: 0.25rem 0;
-}}
-.step-item {{
-    display: flex;
-    align-items: flex-start;
-    gap: 0.8rem;
-}}
-.step-num {{
-    width: 26px; height: 26px;
-    background: {PRIMARY};
-    color: white;
-    border-radius: 50%;
-    font-size: 0.72rem;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    margin-top: 1px;
-    box-shadow: 0 2px 8px rgba(0,94,172,0.3);
-}}
-.step-text {{
-    font-size: 0.8rem;
-    color: {TEXT};
-    line-height: 1.5;
-}}
-.step-text strong {{ color: {PRIMARY}; font-weight: 600; }}
+.sb-run {
+    background: rgba(255,255,255,0.82);
+    border: 1px solid rgba(0,94,172,0.13);
+    border-left: 3px solid #12A150;
+    border-radius: 10px;
+    padding: 0.5rem 0.65rem;
+    margin-bottom: 0.4rem;
+}
+.sb-run .rt { font-size: 0.74rem; font-weight: 700; color: #0D1F33; }
+.sb-run .rs { font-size: 0.66rem; color: #5A7492; margin-top: 0.1rem; }
 
-/* ── Streamlit overrides ── */
-.stTextInput > div > div > input,
-.stTextInput > div > div > input:focus {{
-    border: 1.5px solid {BORDER} !important;
-    border-radius: 10px !important;
-    background: {BG} !important;
-    color: {TEXT} !important;
-    font-family: 'DM Sans', sans-serif !important;
-    font-size: 0.9rem !important;
-    transition: border-color 0.2s, box-shadow 0.2s !important;
-    box-shadow: none !important;
-}}
-.stTextInput > div > div > input:focus {{
-    border-color: {PRIMARY} !important;
-    box-shadow: 0 0 0 3px rgba(0,94,172,0.12) !important;
-}}
+.sb-foot {
+    display: flex; align-items: flex-start; gap: 0.45rem;
+    margin-top: 1.5rem; padding-top: 1rem;
+    border-top: 1px solid rgba(0,94,172,0.15);
+    font-size: 0.68rem; color: #7C97B3; line-height: 1.55;
+}
+.sb-foot .ic { color: #93AFC7; margin-top: 0.12rem; }
 
-.stFileUploader > div {{
-    border: 2px dashed rgba(0,94,172,0.25) !important;
-    border-radius: 14px !important;
-    background: {PRIMARY_SOFT} !important;
-    transition: border-color 0.2s, background 0.2s !important;
-}}
-.stFileUploader > div:hover {{
-    border-color: {PRIMARY} !important;
-    background: rgba(0,94,172,0.08) !important;
-}}
+/* ═══════════════════════════════════════════════════════════════════════
+   PAGE TITLE
+   ═══════════════════════════════════════════════════════════════════════ */
+.page-head { margin-bottom: 2rem; }
+.page-title {
+    display: flex; align-items: center; gap: 0.7rem;
+    font-size: 1.85rem; font-weight: 700; letter-spacing: -0.035em; color: #0D1F33;
+    line-height: 1.15;
+}
+.page-title .glyph {
+    width: 38px; height: 38px; border-radius: 11px;
+    background: #E8F2FC; color: #005EAC;
+    display: inline-flex; align-items: center; justify-content: center;
+}
+.page-sub { font-size: 0.95rem; color: #5A7492; margin-top: 0.45rem; font-weight: 400; }
 
-/* Submit / primary button */
-.stFormSubmitButton > button, .stButton > button {{
-    background: linear-gradient(135deg, {PRIMARY}, {PRIMARY_DARK}) !important;
-    color: white !important;
+/* ═══════════════════════════════════════════════════════════════════════
+   STEPPER
+   ═══════════════════════════════════════════════════════════════════════ */
+.stepper {
+    display: flex; align-items: center;
+    background: #FFFFFF;
+    border: 1px solid rgba(13,31,51,0.07);
+    border-radius: 18px;
+    padding: 1.25rem 1.75rem;
+    box-shadow: 0 1px 2px rgba(13,31,51,0.04), 0 10px 30px -20px rgba(0,94,172,0.25);
+    margin-bottom: 1.9rem;
+}
+.step { display: flex; align-items: center; gap: 0.7rem; }
+.step-dot {
+    width: 30px; height: 30px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.8rem; font-weight: 700; flex-shrink: 0;
+    background: #EDF2F8; color: #8CA5BE; border: 1px solid rgba(13,31,51,0.07);
+    transition: all .25s ease;
+}
+.step.active .step-dot {
+    background: linear-gradient(140deg, #0071CE, #00447D); color: #fff; border-color: transparent;
+    box-shadow: 0 4px 12px rgba(0,94,172,0.32);
+}
+.step.done .step-dot { background: #E7F7EE; color: #12A150; border-color: rgba(18,161,80,0.30); }
+.step-t { font-size: 0.86rem; font-weight: 700; color: #8CA5BE; letter-spacing: -0.01em; line-height: 1.2; }
+.step-s { font-size: 0.71rem; color: #A3B6C9; margin-top: 0.08rem; }
+.step.active .step-t, .step.done .step-t { color: #0D1F33; }
+.step.active .step-s, .step.done .step-s { color: #5A7492; }
+.step-line { flex: 1; height: 2px; background: #E4EBF3; margin: 0 1.1rem; border-radius: 2px; }
+.step-line.filled { background: linear-gradient(90deg, #0071CE, #7FC4F5); }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CARDS
+   ═══════════════════════════════════════════════════════════════════════ */
+.card {
+    background: #FFFFFF;
+    border: 1px solid rgba(13,31,51,0.07);
+    border-radius: 18px;
+    padding: 1.3rem 1.4rem 1.4rem;
+    box-shadow: 0 1px 2px rgba(13,31,51,0.04), 0 10px 30px -18px rgba(0,94,172,0.22);
+    margin-bottom: 1rem;
+}
+.card-head {
+    display: flex; align-items: center; gap: 0.55rem;
+    font-size: 0.92rem; font-weight: 700; color: #0D1F33; letter-spacing: -0.015em;
+    margin-bottom: 0.2rem;
+}
+.card-head .ic { color: #005EAC; }
+.card-head .count {
+    margin-left: auto; font-size: 0.72rem; font-weight: 600; color: #5A7492;
+    background: #F1F5FA; border-radius: 999px; padding: 0.22rem 0.65rem;
+}
+.card-sub { font-size: 0.79rem; color: #5A7492; margin-bottom: 1rem; line-height: 1.5; }
+
+/* Streamlit-rendered blocks that need to sit inside a visual card */
+.stack-card {
+    background: #FFFFFF;
+    border: 1px solid rgba(13,31,51,0.07);
+    border-radius: 18px;
+    box-shadow: 0 1px 2px rgba(13,31,51,0.04), 0 10px 30px -18px rgba(0,94,172,0.22);
+    padding: 1.3rem 1.4rem 0.4rem;
+    margin-bottom: 0.15rem;
+}
+.stack-card + div [data-testid="stElementContainer"] { margin-top: 0; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   FILE UPLOADER → drop zone
+   ═══════════════════════════════════════════════════════════════════════ */
+[data-testid="stFileUploader"] label { display: none !important; }
+[data-testid="stFileUploaderDropzone"], section[data-testid="stFileUploadDropzone"] {
+    border: 2px dashed rgba(0,94,172,0.30) !important;
+    border-radius: 16px !important;
+    background: linear-gradient(180deg, #FAFCFF 0%, #F1F7FE 100%) !important;
+    padding: 2.6rem 1.5rem !important;
+    min-height: 210px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    text-align: center !important;
+    transition: border-color .2s ease, background .2s ease, transform .2s ease !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover, section[data-testid="stFileUploadDropzone"]:hover {
+    border-color: #005EAC !important;
+    background: linear-gradient(180deg, #F4F9FF 0%, #E7F1FD 100%) !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    gap: 0.15rem !important;
+    color: #0D1F33 !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] svg { fill: #005EAC !important; color: #005EAC !important; width: 2.1rem !important; height: 2.1rem !important; opacity: .9; }
+[data-testid="stFileUploaderDropzoneInstructions"] span {
+    font-size: 1.12rem !important; font-weight: 700 !important;
+    color: #0D1F33 !important; letter-spacing: -0.02em !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] small {
+    font-size: 0.78rem !important; color: #5A7492 !important; font-weight: 400 !important;
+}
+/* "Browse files" button inside the dropzone */
+[data-testid="stFileUploaderDropzone"] button, section[data-testid="stFileUploadDropzone"] button {
+    background: linear-gradient(135deg, #005EAC, #00447D) !important;
+    color: #FFFFFF !important;
     border: 0 !important;
-    border-radius: 12px !important;
-    padding: 0.65rem 1.4rem !important;
+    border-radius: 11px !important;
     font-weight: 600 !important;
-    font-family: 'DM Sans', sans-serif !important;
-    font-size: 0.95rem !important;
-    letter-spacing: -0.01em !important;
+    padding: 0.55rem 1.4rem !important;
+    margin-top: 1rem !important;
     box-shadow: 0 4px 14px rgba(0,94,172,0.28) !important;
-    transition: all 0.2s ease !important;
-    cursor: pointer !important;
-}}
-.stFormSubmitButton > button:hover, .stButton > button:hover {{
-    background: linear-gradient(135deg, {ACCENT}, #D4690E) !important;
-    box-shadow: 0 6px 20px rgba(245,130,32,0.35) !important;
+    transition: transform .18s ease, box-shadow .18s ease !important;
+}
+[data-testid="stFileUploaderDropzone"] button:hover, section[data-testid="stFileUploadDropzone"] button:hover {
     transform: translateY(-1px) !important;
-}}
-.stFormSubmitButton > button:active, .stButton > button:active {{
-    transform: translateY(0px) !important;
-}}
-
-.submit-row {{
-    display: flex;
-    justify-content: center;
-    margin-top: 0.75rem;
-}}
-
-.submit-row .stFormSubmitButton {{
-    width: 100%;
-    max-width: 340px;
-}}
-
-/* Download button */
-[data-testid="stDownloadButton"] button {{
-    background: linear-gradient(135deg, #1DA462, #158C52) !important;
-    box-shadow: 0 4px 14px rgba(29,164,98,0.3) !important;
-}}
-[data-testid="stDownloadButton"] button:hover {{
-    background: linear-gradient(135deg, #18C06E, #12A348) !important;
-    box-shadow: 0 6px 20px rgba(29,164,98,0.4) !important;
-}}
-
-/* Progress bar */
-.stProgress > div > div > div > div {{
-    background: linear-gradient(90deg, {PRIMARY}, {ACCENT}) !important;
-    border-radius: 999px !important;
-}}
-.stProgress > div > div > div {{
-    background: {PRIMARY_SOFT} !important;
-    border-radius: 999px !important;
-    height: 6px !important;
-}}
-
-/* Data editor */
-[data-testid="stDataEditor"] {{
+    box-shadow: 0 8px 20px rgba(0,94,172,0.34) !important;
+}
+/* Staged-file rows rendered by Streamlit */
+[data-testid="stFileUploaderFile"] {
+    background: #FFFFFF !important;
+    border: 1px solid rgba(13,31,51,0.09) !important;
     border-radius: 12px !important;
-    overflow: hidden !important;
-    border: 1.5px solid {BORDER} !important;
-}}
+    padding: 0.55rem 0.7rem !important;
+    margin-top: 0.5rem !important;
+    box-shadow: 0 1px 2px rgba(13,31,51,0.04) !important;
+}
+[data-testid="stFileUploaderFile"] [data-testid="stFileUploaderFileName"] {
+    font-size: 0.82rem !important; font-weight: 600 !important; color: #0D1F33 !important;
+}
+[data-testid="stFileUploaderFile"] small { font-size: 0.7rem !important; color: #5A7492 !important; }
+[data-testid="stFileUploaderFile"] svg { color: #005EAC !important; fill: #005EAC !important; }
+[data-testid="stFileUploaderDeleteBtn"] button { color: #8CA5BE !important; }
+[data-testid="stFileUploaderDeleteBtn"] button:hover { color: #D6453F !important; background: rgba(214,69,63,0.08) !important; }
 
-/* Code block */
-.stCode {{
-    border-radius: 12px !important;
-    font-family: 'DM Mono', monospace !important;
-    font-size: 0.8rem !important;
-    background: #F0F4FA !important;
-}}
+/* ═══════════════════════════════════════════════════════════════════════
+   STAGING SUMMARY (right rail)
+   ═══════════════════════════════════════════════════════════════════════ */
+.summary-hero {
+    background: linear-gradient(150deg, #F3F9FF, #E8F2FC);
+    border: 1px solid rgba(0,94,172,0.14);
+    border-radius: 14px;
+    padding: 0.9rem 1rem;
+    margin-bottom: 0.7rem;
+}
+.summary-hero .n { font-size: 2.15rem; font-weight: 700; color: #00447D; line-height: 1; letter-spacing: -0.04em; }
+.summary-hero .l { font-size: 0.68rem; font-weight: 600; color: #5A7492; text-transform: uppercase; letter-spacing: 0.09em; margin-top: 0.25rem; }
+.summary-hero .b { font-size: 0.75rem; color: #5A7492; margin-top: 0.45rem; }
 
-/* Alerts */
-.stAlert {{
-    border-radius: 12px !important;
-    border-left-width: 4px !important;
-}}
+.kind-row { display: flex; flex-direction: column; gap: 0.4rem; }
+.kind {
+    display: flex; align-items: center; gap: 0.6rem;
+    padding: 0.42rem 0.55rem;
+    border-radius: 10px;
+    background: #F8FAFD;
+    border: 1px solid rgba(13,31,51,0.06);
+}
+.kind .tag {
+    font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em;
+    padding: 0.2rem 0.45rem; border-radius: 6px; min-width: 42px; text-align: center;
+}
+.tag.pdf { background: #FDECEC; color: #C0392B; }
+.tag.img { background: #E8F2FC; color: #005EAC; }
+.tag.zip { background: #FDF3E4; color: #B4690E; }
+.tag.doc { background: #FDF3E4; color: #B4690E; }
+.tag.oth { background: #EEF2F7; color: #5A7492; }
+.kind .nm { font-size: 0.78rem; color: #0D1F33; font-weight: 500; }
+.kind .ct { margin-left: auto; font-size: 0.76rem; font-weight: 700; color: #5A7492; }
 
-/* Column gaps */
-[data-testid="column"] {{ padding: 0 0.5rem !important; }}
-[data-testid="column"]:first-child {{ padding-left: 0 !important; }}
-[data-testid="column"]:last-child {{ padding-right: 0 !important; }}
+.stage-empty {
+    border: 1px dashed rgba(13,31,51,0.16);
+    border-radius: 14px;
+    padding: 2.4rem 1rem;
+    text-align: center;
+    background: #FAFCFE;
+}
+.stage-empty .i { color: #A9BED2; }
+.stage-empty .t { font-size: 0.83rem; font-weight: 600; color: #5A7492; margin-top: 0.55rem; }
+.stage-empty .s { font-size: 0.72rem; color: #93A9BF; margin-top: 0.2rem; }
 
-/* Label styling */
-.stTextInput label, .stFileUploader label {{
-    font-size: 0.72rem !important;
-    font-weight: 600 !important;
-    color: {TEXT_MUTED} !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.05em !important;
-}}
+/* ═══════════════════════════════════════════════════════════════════════
+   FORMAT STRIP
+   ═══════════════════════════════════════════════════════════════════════ */
+.fmt-label {
+    font-size: 0.63rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.11em; color: #8CA5BE; margin: 0 0 0.7rem;
+}
+.fmt-strip { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.fmt {
+    display: flex; align-items: center; gap: 0.5rem;
+    background: #FFFFFF;
+    border: 1px solid rgba(13,31,51,0.08);
+    border-radius: 12px;
+    padding: 0.45rem 0.8rem 0.45rem 0.5rem;
+    box-shadow: 0 1px 2px rgba(13,31,51,0.04);
+}
+.fmt .tag { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; padding: 0.22rem 0.45rem; border-radius: 6px; }
+.fmt .d { font-size: 0.76rem; color: #5A7492; }
 
-/* Subheader */
-h3 {{
-    font-size: 1.15rem !important;
+/* ═══════════════════════════════════════════════════════════════════════
+   BUTTONS
+   ═══════════════════════════════════════════════════════════════════════ */
+.stButton > button, .stFormSubmitButton > button {
+    background: linear-gradient(135deg, #005EAC, #00447D) !important;
+    color: #FFFFFF !important;
+    border: 0 !important;
+    border-radius: 13px !important;
+    padding: 0.78rem 1.4rem !important;
     font-weight: 700 !important;
-    color: {TEXT} !important;
-    letter-spacing: -0.02em !important;
-    margin-bottom: 0.75rem !important;
-}}
+    font-family: 'DM Sans', sans-serif !important;
+    font-size: 0.94rem !important;
+    letter-spacing: -0.01em !important;
+    box-shadow: 0 6px 18px -4px rgba(0,94,172,0.45) !important;
+    transition: transform .18s ease, box-shadow .18s ease, background .2s ease !important;
+}
+.stButton > button:hover, .stFormSubmitButton > button:hover {
+    background: linear-gradient(135deg, #0071CE, #00538F) !important;
+    transform: translateY(-1px) !important;
+    box-shadow: 0 10px 26px -6px rgba(0,94,172,0.52) !important;
+}
+.stButton > button:active, .stFormSubmitButton > button:active { transform: translateY(0) !important; }
+.stButton > button:focus:not(:active) { color: #FFFFFF !important; }
+.stButton > button p, .stFormSubmitButton > button p { font-weight: 700 !important; }
 
-/* Caption */
-.stCaption {{ color: {TEXT_MUTED} !important; font-size: 0.73rem !important; }}
+/* Download button — success tone */
+[data-testid="stDownloadButton"] button {
+    background: linear-gradient(135deg, #12A150, #0C8340) !important;
+    box-shadow: 0 6px 18px -4px rgba(18,161,80,0.45) !important;
+}
+[data-testid="stDownloadButton"] button:hover {
+    background: linear-gradient(135deg, #16B85C, #0E9349) !important;
+    box-shadow: 0 10px 26px -6px rgba(18,161,80,0.52) !important;
+}
 
-/* Smaller body text inside cards */
-.card p, .card li {{
-    font-size: 0.8rem;
-    line-height: 1.45;
-}}
+/* ═══════════════════════════════════════════════════════════════════════
+   PROGRESS + LOG CONSOLE
+   ═══════════════════════════════════════════════════════════════════════ */
+.stProgress > div > div > div > div {
+    background: linear-gradient(90deg, #005EAC, #F58220) !important;
+    border-radius: 999px !important;
+}
+.stProgress > div > div > div {
+    background: #E4EDF7 !important;
+    border-radius: 999px !important;
+    height: 7px !important;
+}
 
-/* Expander tweaks */
-details summary {{
-    font-weight: 700;
-    font-size: 1.02rem;
-    color: {PRIMARY};
-}}
+[data-testid="stCode"] { border-radius: 0 0 14px 14px !important; overflow: hidden !important; }
+[data-testid="stCode"] pre {
+    background: #0B1B2B !important;
+    border: 1px solid rgba(0,94,172,0.28) !important;
+    border-radius: 14px !important;
+    padding: 0.9rem 1rem !important;
+    max-height: 330px !important;
+    overflow-y: auto !important;
+}
+[data-testid="stCode"] code, [data-testid="stCode"] pre span {
+    color: #C6DDF2 !important;
+    font-family: 'DM Mono', ui-monospace, monospace !important;
+    font-size: 0.755rem !important;
+    line-height: 1.62 !important;
+}
+[data-testid="stCode"] pre::-webkit-scrollbar { width: 8px; }
+[data-testid="stCode"] pre::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.16); border-radius: 8px; }
+[data-testid="stCodeBlock"] button { color: #7FA6C8 !important; }
 
-details > div {{
-    padding-top: 0.35rem;
-}}
+.console-head {
+    display: flex; align-items: center; gap: 0.5rem;
+    font-size: 0.85rem; font-weight: 700; color: #0D1F33;
+    margin: 0.6rem 0 0.65rem;
+}
+.console-head .ic { color: #005EAC; }
+.console-head .live {
+    margin-left: auto; font-size: 0.63rem; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: #5A7492;
+    background: #F1F5FA; border-radius: 999px; padding: 0.18rem 0.55rem;
+}
 
-/* Warning */
-.stWarning {{ background: {ACCENT_SOFT} !important; color: #7A3B0A !important; }}
+/* ═══════════════════════════════════════════════════════════════════════
+   RESULT PANEL
+   ═══════════════════════════════════════════════════════════════════════ */
+.result-card {
+    background: linear-gradient(150deg, #F2FBF6, #E7F7EE);
+    border: 1px solid rgba(18,161,80,0.24);
+    border-radius: 18px;
+    padding: 1.3rem 1.4rem 0.7rem;
+    box-shadow: 0 10px 30px -18px rgba(18,161,80,0.4);
+}
+.result-card .rh {
+    display: flex; align-items: center; gap: 0.55rem;
+    font-size: 0.95rem; font-weight: 700; color: #0C8340;
+}
+.result-card .rs { font-size: 0.8rem; color: #40765A; margin: 0.3rem 0 1rem; line-height: 1.5; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MISC STREAMLIT OVERRIDES
+   ═══════════════════════════════════════════════════════════════════════ */
+[data-testid="stAlert"] {
+    border-radius: 13px !important;
+    border: 1px solid rgba(13,31,51,0.08) !important;
+    font-size: 0.85rem !important;
+}
+[data-testid="stExpander"] {
+    border: 1px solid rgba(13,31,51,0.07) !important;
+    border-radius: 14px !important;
+    background: #FFFFFF !important;
+    box-shadow: 0 1px 2px rgba(13,31,51,0.04) !important;
+}
+[data-testid="stExpander"] summary { font-weight: 700 !important; font-size: 0.86rem !important; color: #0D1F33 !important; }
+[data-testid="stExpander"] summary:hover { color: #005EAC !important; }
+
+[data-testid="stColumn"] { padding: 0 0.45rem !important; }
+[data-testid="stColumn"]:first-child { padding-left: 0 !important; }
+[data-testid="stColumn"]:last-child  { padding-right: 0 !important; }
+
+.spacer-xs { height: 0.35rem; }
+.spacer-sm { height: 0.75rem; }
+.spacer-md { height: 1.25rem; }
+
+@media (max-width: 900px) {
+    [data-testid="stMainBlockContainer"] { padding: 1rem 1rem 3rem !important; }
+    .page-title { font-size: 1.4rem; }
+    .stepper { flex-direction: column; align-items: flex-start; gap: 0.75rem; }
+    .step-line { display: none; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -424,13 +561,79 @@ def _stage_uploaded_files(uploaded_files, staging_dir: Path) -> list[Path]:
     return staged
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PRESENTATION HELPERS  (display only — no effect on extraction)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Line icons drawn inline as SVG so the UI carries no emoji.  Each entry is the
+# body of a 24×24 stroke icon that inherits the surrounding text colour.
+_ICON_PATHS = {
+    "extract":  '<path d="M12 3v11"/><path d="m8 11 4 4 4-4"/>'
+                '<path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>',
+    "upload":   '<path d="M12 16V4"/><path d="m8 8 4-4 4 4"/>'
+                '<path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+    "stack":    '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 16 9 5 9-5"/><path d="m3 12 9 5 9-5"/>',
+    "inbox":    '<path d="M22 12h-6l-2 3h-4l-2-3H2"/>'
+                '<path d="M5.4 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.4-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.8 1.1Z"/>',
+    "activity": '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>',
+    "check":    '<path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="m22 4-10 10-3-3"/>',
+    "clock":    '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    "shield":   '<path d="M12 3 5 6v5c0 4.4 3 8.4 7 9.6 4-1.2 7-5.2 7-9.6V6l-7-3Z"/>',
+    "receipt":  '<path d="M5 3v18l2-1.4 2 1.4 2-1.4 2 1.4 2-1.4 2 1.4V3l-2 1.4L13 3l-2 1.4L9 3 7 4.4 5 3Z"/>'
+                '<path d="M9 8h6"/><path d="M9 12h6"/>',
+}
+
+
+def _icon(name: str, size: int = 16, stroke: float = 1.8) -> str:
+    """Return an inline SVG icon that inherits the current text colour."""
+    body = _ICON_PATHS.get(name, "")
+    return (
+        f'<svg class="ic" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
+        f'stroke="currentColor" stroke-width="{stroke}" stroke-linecap="round" '
+        f'stroke-linejoin="round" aria-hidden="true">{body}</svg>'
+    )
+
+
+_KIND_BY_SUFFIX = {
+    ".pdf":  ("PDF", "pdf", "PDF documents"),
+    ".jpg":  ("IMG", "img", "Images"),
+    ".jpeg": ("IMG", "img", "Images"),
+    ".png":  ("IMG", "img", "Images"),
+    ".zip":  ("ZIP", "zip", "Archives"),
+    ".doc":  ("DOC", "doc", "Word documents"),
+    ".docx": ("DOC", "doc", "Word documents"),
+}
+
+
+def _human_size(num_bytes: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if num_bytes < 1024 or unit == "GB":
+            return f"{num_bytes:.0f} {unit}" if unit in ("B", "KB") else f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} GB"
+
+
+def _kind_of(file_name: str) -> tuple[str, str, str]:
+    return _KIND_BY_SUFFIX.get(Path(str(file_name)).suffix.lower(), ("FILE", "oth", "Other"))
+
+
+def _console_block(placeholder, lines: list[str]) -> None:
+    """Render the activity log into `placeholder`.  Stays hidden until a run starts."""
+    if not lines:
+        placeholder.empty()
+        return
+    with placeholder.container():
+        st.markdown(
+            f'<div class="console-head">{_icon("activity")}Activity log'
+            f'<span class="live">{len(lines)} entries</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.code("\n".join(lines[-250:]), language="text")
+
+
 def _append_log(logs: list[str], message: str, placeholder) -> None:
     logs.append(message)
-    with placeholder.container():
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-header">📋 Processing log</div>', unsafe_allow_html=True)
-        st.code("\n".join(logs[-250:]) or "No run yet.", language="text")
-        st.markdown("</div>", unsafe_allow_html=True)
+    _console_block(placeholder, logs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -618,132 +821,208 @@ def _match_password(source_text: str, custom_passwords: dict[str, str]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOP BAR
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="topbar">
-    <div class="topbar-logo">💼</div>
-    <div>
-        <div class="topbar-title">Commission Extractor</div>
-        <div class="topbar-sub">Automated receipt processing &amp; Excel export</div>
-    </div>
-    <div class="topbar-badge">v2.0</div>
-</div>
-""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TIP
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="tip-banner">
-    💡 <strong>Tip:</strong>&nbsp;Upload individual files, a whole folder, or a ZIP archive — all at once. ZIPs are unpacked automatically.
-</div>
-""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN FORM
-# ─────────────────────────────────────────────────────────────────────────────
-with st.form("processing_form"):
-    col_left, col_right = st.columns([1.3, 0.7], gap="large")
-
-    with col_left:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-header">📂 File inputs</div>', unsafe_allow_html=True)
-
-        uploaded_files = st.file_uploader(
-            "Upload files, folder, or ZIP",
-            key="uploaded_files",
-            accept_multiple_files=True,
-            type=SUPPORTED_TYPES,
-            help="Select individual PDFs/images, a whole folder, or ZIP archives. ZIPs are unpacked automatically.",
-        )
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_right:
-        st.markdown('<div class="card" style="height:100%;display:flex;flex-direction:column;">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-header">⚡ How it works</div>', unsafe_allow_html=True)
-
-        st.markdown("""
-        <div class="step-list">
-            <div class="step-item">
-                <div class="step-num">1</div>
-                <div class="step-text">Upload your <strong>receipt files</strong>, folder, or ZIP archive</div>
-            </div>
-            <div class="step-item">
-                <div class="step-num">2</div>
-                <div class="step-text">Files are <strong>staged, deduplicated</strong> and normalised automatically</div>
-            </div>
-            <div class="step-item">
-                <div class="step-num">3</div>
-                <div class="step-text">Agent codes are <strong>matched & mapped</strong> from the master sheet</div>
-            </div>
-            <div class="step-item">
-                <div class="step-num">4</div>
-                <div class="step-text">Download a clean, ready-to-use <strong>Excel workbook</strong></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<div style='flex:1'></div>", unsafe_allow_html=True)
-        st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
-
-        process_clicked = st.form_submit_button(
-            "🚀  Process files",
-            use_container_width=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SUPPORTED FORMATS STRIP
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-with st.expander("� Supported formats & output features", expanded=False):
-    st.markdown("""
-    <div class="stats-row">
-        <div class="stat-chip"><span class="val">PDF</span><span class="lbl">Encrypted &amp; plain</span></div>
-        <div class="stat-chip"><span class="val">IMG</span><span class="lbl">JPG / PNG</span></div>
-        <div class="stat-chip"><span class="val">ZIP</span><span class="lbl">Auto-unpacked</span></div>
-        <div class="stat-chip"><span class="val">DOC</span><span class="lbl">Word documents</span></div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-    st.markdown("""
-    <div class="step-list">
-        <div class="step-item">
-            <div class="step-num" style="background:#1DA462">✓</div>
-            <div class="step-text">Duplicate receipts removed automatically</div>
-        </div>
-        <div class="step-item">
-            <div class="step-num" style="background:#1DA462">✓</div>
-            <div class="step-text">Agent codes mapped from master list</div>
-        </div>
-        <div class="step-item">
-            <div class="step-num" style="background:#1DA462">✓</div>
-            <div class="step-text">Single-click Excel download</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
 if "result_path" not in st.session_state:
     st.session_state.result_path = ""
 if "logs" not in st.session_state:
     st.session_state.logs = []
+if "runs" not in st.session_state:
+    st.session_state.runs = []          # display-only history of this session
 
-log_placeholder    = st.empty()
-status_placeholder = st.empty()
+# Files already picked in a previous rerun — used to drive the stepper and the
+# staging summary before the uploader widget is re-instantiated below.
+_pending = st.session_state.get("uploaded_files") or []
+_has_files  = bool(_pending)
+_has_result = bool(st.session_state.result_path and Path(st.session_state.result_path).exists())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(f"""
+    <div class="sb-brand">
+        <div class="sb-mark">{_icon("receipt", 20)}</div>
+        <div>
+            <div class="sb-brand-name">Commission Extractor</div>
+            <div class="sb-brand-sub">Finance automation</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    _staged_bytes = sum(getattr(f, "size", 0) or 0 for f in _pending)
+
+    st.markdown(f"""
+    <div class="sb-label">Ready to extract</div>
+    <div class="sb-metrics">
+        <div class="sb-metric"><div class="v">{len(_pending)}</div><div class="k">Files</div></div>
+        <div class="sb-metric"><div class="v">{_human_size(_staged_bytes)}</div><div class="k">Size</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="sb-label">Recent runs</div>', unsafe_allow_html=True)
+    if st.session_state.runs:
+        _run_html = "".join(
+            f'<div class="sb-run"><div class="rt">{html.escape(r["time"])}</div>'
+            f'<div class="rs">{r["files"]} file(s) &rarr; {r["rows"]} row(s)</div></div>'
+            for r in reversed(st.session_state.runs[-6:])
+        )
+        st.markdown(_run_html, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="sb-empty">
+            <div class="ico">{_icon("clock", 22)}</div>
+            <div class="t">No runs yet</div>
+            <div class="s">Your results will appear here</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="sb-foot">{_icon("shield", 14)}
+        <span>Your files stay private and are deleted automatically when you close this page.</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE HEAD
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div class="page-head">
+    <div class="page-title"><span class="glyph">{_icon("extract", 20)}</span>Commission Extraction</div>
+    <div class="page-sub">Upload your receipts and download a ready-to-use Excel workbook.</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEPPER  (reflects real state: files staged → result written)
+# ─────────────────────────────────────────────────────────────────────────────
+def _step_class(step_no: int) -> str:
+    active = 3 if _has_result else (2 if _has_files else 1)
+    if step_no < active:
+        return "step done"
+    if step_no == active:
+        return "step active"
+    return "step"
+
+
+st.markdown(f"""
+<div class="stepper">
+    <div class="{_step_class(1)}">
+        <div class="step-dot">1</div>
+        <div><div class="step-t">Upload receipts</div><div class="step-s">Add files, folder or ZIP</div></div>
+    </div>
+    <div class="step-line {'filled' if _has_files else ''}"></div>
+    <div class="{_step_class(2)}">
+        <div class="step-dot">2</div>
+        <div><div class="step-t">Extract &amp; map</div><div class="step-s">Read fields, match agents</div></div>
+    </div>
+    <div class="step-line {'filled' if _has_result else ''}"></div>
+    <div class="{_step_class(3)}">
+        <div class="step-dot">3</div>
+        <div><div class="step-t">Review &amp; download</div><div class="step-s">Validate math and export</div></div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPLOAD ROW — drop zone (left) + staging summary & CTA (right)
+# ─────────────────────────────────────────────────────────────────────────────
+col_drop, col_stage = st.columns([1.55, 0.95], gap="medium")
+
+with col_drop:
+    st.markdown(f"""
+    <div class="stack-card">
+        <div class="card-head">{_icon("upload")}Upload receipts</div>
+        <div class="card-sub">Add as many files as you like. Password-protected PDFs and ZIP folders
+        are handled for you.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader(
+        "Upload files, folder, or ZIP",
+        key="uploaded_files",
+        accept_multiple_files=True,
+        type=SUPPORTED_TYPES,
+        label_visibility="collapsed",
+        help="Select individual PDFs/images, a whole folder, or ZIP archives. ZIPs are unpacked automatically.",
+    )
+
+with col_stage:
+    _files = uploaded_files or []
+    if _files:
+        _total_bytes = sum(getattr(f, "size", 0) or 0 for f in _files)
+        _by_kind: dict[str, dict] = {}
+        for f in _files:
+            tag, cls, label = _kind_of(f.name)
+            entry = _by_kind.setdefault(tag, {"cls": cls, "label": label, "n": 0})
+            entry["n"] += 1
+        _kind_html = "".join(
+            f'<div class="kind"><span class="tag {v["cls"]}">{html.escape(k)}</span>'
+            f'<span class="nm">{html.escape(v["label"])}</span>'
+            f'<span class="ct">{v["n"]}</span></div>'
+            for k, v in sorted(_by_kind.items(), key=lambda kv: -kv[1]["n"])
+        )
+        st.markdown(f"""
+        <div class="card">
+            <div class="card-head">{_icon("stack")}Selected files</div>
+            <div class="summary-hero">
+                <div class="n">{len(_files)}</div>
+                <div class="l">Files ready</div>
+                <div class="b">{_human_size(_total_bytes)} in total</div>
+            </div>
+            <div class="kind-row">{_kind_html}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="card">
+            <div class="card-head">{_icon("stack")}Selected files</div>
+            <div class="stage-empty">
+                <div class="i">{_icon("inbox", 26)}</div>
+                <div class="t">Nothing selected yet</div>
+                <div class="s">Add receipts on the left to begin</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    process_clicked = st.button(
+        "Start extraction",
+        use_container_width=True,
+        type="primary",
+    )
+
+st.markdown('<div class="spacer-md"></div>', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPPORTED FORMATS STRIP
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="fmt-label">Accepted formats</div>
+<div class="fmt-strip">
+    <div class="fmt"><span class="tag pdf">PDF</span><span class="d">Including password-protected</span></div>
+    <div class="fmt"><span class="tag img">IMG</span><span class="d">JPG &amp; PNG scans</span></div>
+    <div class="fmt"><span class="tag zip">ZIP</span><span class="d">Folders &amp; archives</span></div>
+    <div class="fmt"><span class="tag doc">DOC</span><span class="d">Word documents</span></div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="spacer-md"></div>', unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSOLE / STATUS / DOWNLOAD PLACEHOLDERS
+# ─────────────────────────────────────────────────────────────────────────────
+status_placeholder   = st.empty()
+progress_placeholder = st.empty()
+log_placeholder      = st.empty()
 download_placeholder = st.empty()
 
 
 def render_logs() -> None:
-    with log_placeholder.container():
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-header">📋 Processing log</div>', unsafe_allow_html=True)
-        st.code("\n".join(st.session_state.logs[-250:]) or "No run yet.", language="text")
-        st.markdown("</div>", unsafe_allow_html=True)
+    _console_block(log_placeholder, st.session_state.logs)
 
 
 render_logs()
@@ -796,7 +1075,7 @@ if process_clicked:
     mis_file_details: list[dict] = []
 
     all_rows: list[extractor.ReceiptLineItem] = []
-    progress = st.progress(0)
+    progress = progress_placeholder.progress(0)
     total = len(unique_inputs)
 
     for index, file_path in enumerate(unique_inputs, start=1):
@@ -819,7 +1098,7 @@ if process_clicked:
                 if str(file_path).lower().endswith(".pdf") and not extractor._extractor.get_google_vision_api_key():
                     _append_log(
                         st.session_state.logs,
-                        "  ⚠ This may be a scanned PDF.  GOOGLE_VISION_API_KEY is not set — "
+                        "  ! This may be a scanned PDF.  GOOGLE_VISION_API_KEY is not set — "
                         "add it to Streamlit secrets so cloud OCR is available.",
                         log_placeholder,
                     )
@@ -868,8 +1147,9 @@ if process_clicked:
 
     st.session_state.result_path = str(output_file)
 
-    _append_log(st.session_state.logs, f"✅ Wrote {len(df)} row(s) to {output_file}", log_placeholder)
-    status_placeholder.success(f"✅  Done — {len(df)} rows written successfully.")
+    _append_log(st.session_state.logs, f"Done. Wrote {len(df)} row(s) to {output_file}", log_placeholder)
+    status_placeholder.success(f"Done — {len(df)} row(s) written successfully.")
+    progress_placeholder.empty()
     render_logs()
 
     # ── Silent MIS logging — Google Sheet primary, Gmail fallback ──
@@ -949,6 +1229,14 @@ if process_clicked:
         if mis_errors:
             _append_log(st.session_state.logs, f"(MIS: {'; '.join(mis_errors)})", log_placeholder)
 
+        # Display-only run history for the sidebar (no effect on extraction).
+        st.session_state.runs.append({
+            "time"   : mis_finished.strftime("%d %b %Y, %I:%M %p"),
+            "files"  : len(mis_file_details),
+            "rows"   : len(df),
+            "seconds": round(duration_s, 1),
+        })
+
     except Exception as exc:
         _append_log(st.session_state.logs, f"(MIS error: {exc})", log_placeholder)
 
@@ -959,14 +1247,19 @@ if process_clicked:
 if st.session_state.result_path:
     result_file = Path(st.session_state.result_path)
     if result_file.exists():
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="card" style="border-color:rgba(29,164,98,0.25);background:rgba(29,164,98,0.03)">', unsafe_allow_html=True)
-        st.markdown('<div class="sec-header" style="color:#1DA462">📥 Download result</div>', unsafe_allow_html=True)
-        st.download_button(
-            label="⬇️  Download Excel workbook",
-            data=result_file.read_bytes(),
-            file_name=result_file.name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+        with download_placeholder.container():
+            st.markdown('<div class="spacer-md"></div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="result-card">
+                <div class="rh">{_icon("check", 18)}Extraction complete</div>
+                <div class="rs">Your workbook is ready — one row per receipt, with agent codes filled in
+                and the commission amounts checked.</div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.download_button(
+                label="Download Excel workbook",
+                data=result_file.read_bytes(),
+                file_name=result_file.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
