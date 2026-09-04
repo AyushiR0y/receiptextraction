@@ -34,6 +34,8 @@ Non_Individual Invoices 22 To 30 Sep'25/
 # Output files - results
 *.xlsx
 ~$*.xlsx
+# ...except the agent master, which the extractor needs to fill AGENT_CODE.
+!agent_details_full.xlsx
 
 # External tools/dependencies
 poppler-*/
