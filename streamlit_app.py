@@ -809,10 +809,12 @@ def _log_mis_to_google_sheet(row: dict) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _send_mis_gmail(subject: str, body: str) -> tuple[bool, str]:
+def _send_mis_gmail(subject: str, body: str, html_body: str | None = None) -> tuple[bool, str]:
     """Send MIS report via Gmail SMTP (App Password).
     Secrets needed: GMAIL_USERNAME, GMAIL_APP_PASSWORD, MIS_EMAIL_TO.
     MIS_EMAIL_TO may be a comma-separated list of addresses.
+    When html_body is given it is attached as an alternative part, so clients
+    that render HTML show the table and everything else still sees `body`.
     """
     user = _get_secret("GMAIL_USERNAME")
     password = _get_secret("GMAIL_APP_PASSWORD")
@@ -827,6 +829,8 @@ def _send_mis_gmail(subject: str, body: str) -> tuple[bool, str]:
         msg["From"] = user
         msg["To"] = ", ".join(recipients)
         msg.set_content(body)
+        if html_body:
+            msg.add_alternative(html_body, subtype="html")
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
             server.starttls()
             server.login(user, password)
@@ -834,6 +838,94 @@ def _send_mis_gmail(subject: str, body: str) -> tuple[bool, str]:
         return True, f"sent via Gmail to {len(recipients)} recipient(s)"
     except Exception as exc:
         return False, str(exc)
+
+
+def _mis_html_report(
+    mis_row: dict,
+    ai_in_tokens: int,
+    ai_out_tokens: int,
+    file_details: list[dict],
+) -> str:
+    """Build the HTML version of the MIS mail — the same numbers as the plain-text
+    body, laid out as a table.  Uses table markup + inline styles only, which is
+    what mail clients (Gmail, Outlook) reliably render.
+    """
+    esc = html.escape
+
+    headers = [
+        "Date", "Duration (in secs)", "Files", "Pages", "Rows Written",
+        "GV OCR calls", "AI Calls", "AI in tokens", "AI out tokens", "Est. AI cost",
+    ]
+    # "Timestamp" is "%d %m %Y %I:%M:%S %p IST" — the first three parts are the date.
+    ts_parts = str(mis_row.get("Timestamp", "")).split()
+    run_date = "-".join(ts_parts[:3]) if len(ts_parts) >= 3 else str(mis_row.get("Timestamp", ""))
+    values = [
+        run_date,
+        mis_row.get("Duration (s)", ""),
+        mis_row.get("Files Processed", ""),
+        mis_row.get("Total Pages", ""),
+        mis_row.get("Rows Written", ""),
+        mis_row.get("GV OCR Calls", ""),
+        mis_row.get("AI (LLM) Calls", ""),
+        f"{int(ai_in_tokens):,}",
+        f"{int(ai_out_tokens):,}",
+        mis_row.get("Est. AI Cost (INR)", ""),
+    ]
+
+    th = (
+        "padding:9px 12px;border:1px solid #D4DEE8;background:%s;color:#FFFFFF;"
+        "font-weight:600;text-align:left;white-space:nowrap;" % PRIMARY
+    )
+    td = "padding:9px 12px;border:1px solid #D4DEE8;color:#1B2A3A;white-space:nowrap;"
+
+    head_cells = "".join(f'<th style="{th}">{esc(h)}</th>' for h in headers)
+    body_cells = "".join(f'<td style="{td}">{esc(str(v))}</td>' for v in values)
+
+    detail_rows = "".join(
+        "<tr>"
+        f'<td style="{td}white-space:normal;">{esc(str(d.get("name", "")))}</td>'
+        f'<td style="{td}">{esc(str(d.get("pages", "")))}</td>'
+        f'<td style="{td}">{esc(str(d.get("rows", "")))}</td>'
+        f'<td style="{td}white-space:normal;">{esc(str(d.get("status", "")))}</td>'
+        "</tr>"
+        for d in file_details
+    )
+    detail_head = "".join(
+        f'<th style="{th}">{esc(h)}</th>' for h in ("File", "Pages", "Rows", "Status")
+    )
+
+    return f"""<html><body style="margin:0;padding:20px;background:#F4F7FA;
+ font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:13px;color:#1B2A3A;">
+  <div style="max-width:960px;margin:0 auto;background:#FFFFFF;border:1px solid #D4DEE8;
+   border-radius:8px;padding:22px;">
+    <div style="font-size:17px;font-weight:600;color:{PRIMARY};margin-bottom:2px;">
+      Commission Extractor — MIS Usage Report
+    </div>
+    <div style="color:#5A6B7C;margin-bottom:16px;">
+      Run finished {esc(str(mis_row.get("Timestamp", "")))}
+    </div>
+
+    <table cellpadding="0" cellspacing="0" border="0"
+     style="border-collapse:collapse;width:100%;font-size:13px;">
+      <thead><tr>{head_cells}</tr></thead>
+      <tbody><tr>{body_cells}</tr></tbody>
+    </table>
+
+    <div style="font-size:14px;font-weight:600;color:{PRIMARY};margin:22px 0 8px;">
+      Per-file detail
+    </div>
+    <table cellpadding="0" cellspacing="0" border="0"
+     style="border-collapse:collapse;width:100%;font-size:13px;">
+      <thead><tr>{detail_head}</tr></thead>
+      <tbody>{detail_rows}</tbody>
+    </table>
+
+    <div style="color:#5A6B7C;font-size:11px;margin-top:16px;">
+      Cost estimated at GPT-4o-mini rates (1 USD &#8776; 84 INR); tokens approximated as
+      characters &#247; 4.
+    </div>
+  </div>
+</body></html>"""
 
 
 def _deliver_mis(subject: str, body: str) -> tuple[bool, str]:
@@ -1311,7 +1403,15 @@ if process_clicked:
                 "Per-file detail:",
                 mis_row["Per-file Detail"].replace(" | ", "\n"),
             ]
-            ok, detail = _send_mis_gmail(subject, "\n".join(body_lines))
+            # HTML table view; if it cannot be built the mail still goes out as
+            # the plain-text body exactly as before.
+            try:
+                html_body = _mis_html_report(
+                    mis_row, int(_ai_in_tokens), int(_ai_out_tokens), mis_file_details
+                )
+            except Exception:
+                html_body = None
+            ok, detail = _send_mis_gmail(subject, "\n".join(body_lines), html_body)
             if not ok:
                 mis_errors.append(f"Gmail failed: {detail}")
 
