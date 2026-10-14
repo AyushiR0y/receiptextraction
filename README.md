@@ -235,6 +235,10 @@ Configure it through secrets: `MIS_GOOGLE_SHEET_URL`, `GMAIL_USERNAME`,
 none of these set the run works normally and the log simply notes that no MIS
 channel is configured.
 
+The mail is sent as `Commissions <GMAIL_USERNAME>` so it can be filtered or
+searched on the sender name in Outlook even when the same mailbox is shared with
+another reporting tool. Set `MIS_SENDER_NAME` to use a different display name.
+
 > `mis_appscript.gs` in the repo is currently empty — the Apps Script that
 > receives the POST has to be pasted in before that path will work.
 

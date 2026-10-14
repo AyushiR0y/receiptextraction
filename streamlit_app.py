@@ -743,6 +743,7 @@ import logging as _logging
 import urllib.request
 import urllib.error
 from email.message import EmailMessage
+from email.utils import formataddr
 
 
 def _get_secret(key: str, default: str = "") -> str:
@@ -813,6 +814,9 @@ def _send_mis_gmail(subject: str, body: str, html_body: str | None = None) -> tu
     """Send MIS report via Gmail SMTP (App Password).
     Secrets needed: GMAIL_USERNAME, GMAIL_APP_PASSWORD, MIS_EMAIL_TO.
     MIS_EMAIL_TO may be a comma-separated list of addresses.
+    MIS_SENDER_NAME (optional) is the display name shown in the inbox; it
+    defaults to "Commissions" so these mails are easy to pick out in Outlook
+    when the same mailbox is also used by another reporter.
     When html_body is given it is attached as an alternative part, so clients
     that render HTML show the table and everything else still sees `body`.
     """
@@ -826,7 +830,7 @@ def _send_mis_gmail(subject: str, body: str, html_body: str | None = None) -> tu
     try:
         msg = EmailMessage()
         msg["Subject"] = subject
-        msg["From"] = user
+        msg["From"] = formataddr((_get_secret("MIS_SENDER_NAME") or "Commissions", user))
         msg["To"] = ", ".join(recipients)
         msg.set_content(body)
         if html_body:
