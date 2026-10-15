@@ -1125,8 +1125,8 @@ with col_drop:
     st.markdown(f"""
     <div class="stack-card">
         <div class="card-head">{_icon("upload")}Upload receipts</div>
-        <div class="card-sub">Add as many files as you like. Password-protected PDFs and ZIP folders
-        are handled for you.</div>
+        <div class="card-sub">Add as many files as you like. ZIP folders are unpacked for
+        you.</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1191,7 +1191,7 @@ st.markdown('<div class="spacer-md"></div>', unsafe_allow_html=True)
 st.markdown("""
 <div class="fmt-label">Accepted formats</div>
 <div class="fmt-strip">
-    <div class="fmt"><span class="tag pdf">PDF</span><span class="d">Including password-protected</span></div>
+    <div class="fmt"><span class="tag pdf">PDF</span><span class="d">Text &amp; scanned invoices</span></div>
     <div class="fmt"><span class="tag img">IMG</span><span class="d">JPG &amp; PNG scans</span></div>
     <div class="fmt"><span class="tag zip">ZIP</span><span class="d">Folders &amp; archives</span></div>
     <div class="fmt"><span class="tag doc">DOC</span><span class="d">Word documents</span></div>
