@@ -291,6 +291,22 @@ header[data-testid="stHeader"] { background: transparent !important; }
 }
 .card-sub { font-size: 0.79rem; color: #5A7492; margin-bottom: 1rem; line-height: 1.5; }
 
+/* Divider label between the file drop zone and the folder drop zone */
+.drop-split {
+    display: flex; align-items: center; gap: 0.1rem;
+    font-size: 0.76rem; font-weight: 600; color: #5A7492;
+    margin: 0.65rem 0 0.4rem;
+}
+.drop-split .ic { color: #005EAC; }
+.drop-hint {
+    font-size: 0.73rem; color: #5A7492; line-height: 1.55;
+    background: #F6F9FD; border: 1px solid rgba(13,31,51,0.06);
+    border-radius: 10px; padding: 0.55rem 0.7rem; margin-top: 0.5rem;
+}
+.drop-hint b { color: #0D1F33; font-weight: 650; }
+.drop-hint ul { margin: 0.35rem 0 0; padding-left: 1.05rem; }
+.drop-hint li { margin-bottom: 0.15rem; }
+
 /* Streamlit-rendered blocks that need to sit inside a visual card */
 .stack-card {
     background: #FFFFFF;
@@ -401,6 +417,7 @@ header[data-testid="stHeader"] { background: transparent !important; }
 .tag.img { background: #E8F2FC; color: #005EAC; }
 .tag.zip { background: #FDF3E4; color: #B4690E; }
 .tag.doc { background: #FDF3E4; color: #B4690E; }
+.tag.fdr { background: #ECF7EF; color: #1E7A46; }
 .tag.oth { background: #EEF2F7; color: #5A7492; }
 .kind .nm { font-size: 0.78rem; color: #0D1F33; font-weight: 500; }
 .kind .ct { margin-left: auto; font-size: 0.76rem; font-weight: 700; color: #5A7492; }
@@ -585,12 +602,22 @@ def _normalize_uploaded_name(name: str) -> Path:
 
 
 def _stage_uploaded_files(uploaded_files, staging_dir: Path) -> list[Path]:
-    """Write uploaded files to a temp directory, automatically expanding ZIPs."""
+    """Write uploaded files to a temp directory, automatically expanding ZIPs.
+
+    Folder uploads report each file with its path relative to the picked folder
+    (``invoices/april/abc.pdf``), so that structure is recreated under
+    `staging_dir` instead of being flattened.  Two folders can still contribute
+    the same relative path, so a collision falls back to a per-file bucket.
+    """
     import zipfile
     staged: list[Path] = []
+    taken: set[Path] = set()
     for index, uploaded in enumerate(uploaded_files, start=1):
         relative_name = _normalize_uploaded_name(uploaded.name)
-        target = staging_dir / f"upload_{index}" / relative_name
+        target = staging_dir / relative_name
+        if target in taken:
+            target = staging_dir / f"upload_{index}" / relative_name
+        taken.add(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         raw = uploaded.getbuffer()
         target.write_bytes(raw)
@@ -599,7 +626,7 @@ def _stage_uploaded_files(uploaded_files, staging_dir: Path) -> list[Path]:
         if target.suffix.lower() == ".zip":
             try:
                 with zipfile.ZipFile(target, "r") as zf:
-                    extract_dir = target.parent / target.stem
+                    extract_dir = target.parent / f"{target.stem}_unzipped"
                     extract_dir.mkdir(parents=True, exist_ok=True)
                     zf.extractall(extract_dir)
                     for member in zf.infolist():
@@ -638,6 +665,7 @@ _ICON_PATHS = {
     "shield":   '<path d="M12 3 5 6v5c0 4.4 3 8.4 7 9.6 4-1.2 7-5.2 7-9.6V6l-7-3Z"/>',
     "receipt":  '<path d="M5 3v18l2-1.4 2 1.4 2-1.4 2 1.4 2-1.4 2 1.4V3l-2 1.4L13 3l-2 1.4L9 3 7 4.4 5 3Z"/>'
                 '<path d="M9 8h6"/><path d="M9 12h6"/>',
+    "folder":   '<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>',
 }
 
 
@@ -1011,8 +1039,11 @@ if "runs" not in st.session_state:
     st.session_state.runs = []          # display-only history of this session
 
 # Files already picked in a previous rerun — used to drive the stepper and the
-# staging summary before the uploader widget is re-instantiated below.
-_pending = st.session_state.get("uploaded_files") or []
+# staging summary before the uploader widgets are re-instantiated below.  Files
+# and folders come from two separate widgets and are always handled together.
+_pending = (st.session_state.get("uploaded_files") or []) + (
+    st.session_state.get("uploaded_folders") or []
+)
 _has_files  = bool(_pending)
 _has_result = bool(st.session_state.result_path and Path(st.session_state.result_path).exists())
 
@@ -1100,7 +1131,7 @@ st.markdown(f"""
 <div class="stepper">
     <div class="{_step_class(1)}">
         <div class="step-dot">1</div>
-        <div><div class="step-t">Upload receipts</div><div class="step-s">Add files, folder or ZIP</div></div>
+        <div><div class="step-t">Upload receipts</div><div class="step-s">Add files, folders or ZIPs</div></div>
     </div>
     <div class="step-line {'filled' if _has_files else ''}"></div>
     <div class="{_step_class(2)}">
@@ -1125,24 +1156,73 @@ with col_drop:
     st.markdown(f"""
     <div class="stack-card">
         <div class="card-head">{_icon("upload")}Upload receipts</div>
-        <div class="card-sub">Add as many files as you like. ZIP folders are unpacked for
-        you.</div>
+        <div class="card-sub">Add as many files as you like, or pick whole folders and every
+        receipt inside them is taken &mdash; sub-folders included. ZIPs are unpacked for you.</div>
     </div>
     """, unsafe_allow_html=True)
 
     uploaded_files = st.file_uploader(
-        "Upload files, folder, or ZIP",
+        "Upload files or ZIPs",
         key="uploaded_files",
         accept_multiple_files=True,
         type=SUPPORTED_TYPES,
         label_visibility="collapsed",
-        help="Select individual PDFs/images, a whole folder, or ZIP archives. ZIPs are unpacked automatically.",
+        help="Select individual PDFs, images, Word files or ZIP archives. ZIPs are unpacked automatically.",
+    )
+
+    st.markdown(
+        f'<div class="drop-split">{_icon("folder", 14)}'
+        "&nbsp;&hellip;or add entire folders</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Directory mode uploads every supported file inside the picked folder and
+    # its sub-folders.  Browsing again adds another folder rather than replacing
+    # the first, so any number of folders can be stacked up before extraction.
+    uploaded_folders = st.file_uploader(
+        "Upload entire folders",
+        key="uploaded_folders",
+        accept_multiple_files="directory",
+        type=SUPPORTED_TYPES,
+        label_visibility="collapsed",
+        help=(
+            "Drag several folders onto this box together to upload them all in one go. "
+            "The Browse dialog opens one folder at a time, but each pick adds to the "
+            "list instead of replacing it, and sub-folders are always included."
+        ),
+    )
+
+    # The browser's directory dialog is single-select — there is no web API that
+    # opens a multi-folder picker — so the three routes that do take many folders
+    # are spelled out here rather than left for the user to discover.
+    st.markdown(
+        """
+        <div class="drop-hint">
+            <b>To add many folders at once:</b>
+            <ul>
+                <li><b>Drag them in together</b> &mdash; select the folders in Explorer and
+                drop them all onto the box above.</li>
+                <li><b>Or pick the parent folder</b> that holds them &mdash; every
+                sub-folder is walked for you.</li>
+                <li><b>Or press Browse again</b> for each folder &mdash; picks add up,
+                they do not replace each other.</li>
+            </ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
 with col_stage:
-    _files = uploaded_files or []
+    _files = (uploaded_files or []) + (uploaded_folders or [])
     if _files:
         _total_bytes = sum(getattr(f, "size", 0) or 0 for f in _files)
+        # Folder uploads carry a relative path, so the leading segment names the
+        # folder each file came from.
+        _folders = {
+            _normalize_uploaded_name(f.name).parts[0]
+            for f in _files
+            if len(_normalize_uploaded_name(f.name).parts) > 1
+        }
         _by_kind: dict[str, dict] = {}
         for f in _files:
             tag, cls, label = _kind_of(f.name)
@@ -1154,13 +1234,16 @@ with col_stage:
             f'<span class="ct">{v["n"]}</span></div>'
             for k, v in sorted(_by_kind.items(), key=lambda kv: -kv[1]["n"])
         )
+        _folder_note = (
+            f" &middot; {len(_folders)} folder(s)" if _folders else ""
+        )
         st.markdown(f"""
         <div class="card">
             <div class="card-head">{_icon("stack")}Selected files</div>
             <div class="summary-hero">
                 <div class="n">{len(_files)}</div>
                 <div class="l">Files ready</div>
-                <div class="b">{_human_size(_total_bytes)} in total</div>
+                <div class="b">{_human_size(_total_bytes)} in total{_folder_note}</div>
             </div>
             <div class="kind-row">{_kind_html}</div>
         </div>
@@ -1172,7 +1255,7 @@ with col_stage:
             <div class="stage-empty">
                 <div class="i">{_icon("inbox", 26)}</div>
                 <div class="t">Nothing selected yet</div>
-                <div class="s">Add receipts on the left to begin</div>
+                <div class="s">Add files or folders on the left to begin</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1193,7 +1276,8 @@ st.markdown("""
 <div class="fmt-strip">
     <div class="fmt"><span class="tag pdf">PDF</span><span class="d">Text &amp; scanned invoices</span></div>
     <div class="fmt"><span class="tag img">IMG</span><span class="d">JPG &amp; PNG scans</span></div>
-    <div class="fmt"><span class="tag zip">ZIP</span><span class="d">Folders &amp; archives</span></div>
+    <div class="fmt"><span class="tag zip">ZIP</span><span class="d">Archives, unpacked for you</span></div>
+    <div class="fmt"><span class="tag fdr">DIR</span><span class="d">Whole folders &amp; sub-folders</span></div>
     <div class="fmt"><span class="tag doc">DOC</span><span class="d">Word documents</span></div>
 </div>
 """, unsafe_allow_html=True)
@@ -1222,7 +1306,9 @@ if process_clicked:
     st.session_state.logs = []
     render_logs()
 
-    uploaded_files = st.session_state.get("uploaded_files") or []
+    uploaded_files = (st.session_state.get("uploaded_files") or []) + (
+        st.session_state.get("uploaded_folders") or []
+    )
 
     input_paths: list[Path] = []
     staged_root = Path(tempfile.mkdtemp(prefix="commission_streamlit_"))
@@ -1230,10 +1316,15 @@ if process_clicked:
     if uploaded_files:
         staged_files = _stage_uploaded_files(uploaded_files, staged_root)
         input_paths.extend(staged_files)
-        _append_log(st.session_state.logs, f"Staged {len(staged_files)} file(s) (ZIPs unpacked).", log_placeholder)
+        _append_log(
+            st.session_state.logs,
+            f"Staged {len(staged_files)} file(s) from {len(uploaded_files)} upload(s) "
+            "(folders walked, ZIPs unpacked).",
+            log_placeholder,
+        )
 
     if not input_paths:
-        st.warning("Upload at least one file before processing.")
+        st.warning("Upload at least one file or folder before processing.")
         st.stop()
 
     unique_inputs: list[Path] = []

@@ -151,9 +151,18 @@ streamlit run streamlit_app.py
 Opens on <http://localhost:8501>; choose another port with
 `streamlit run streamlit_app.py --server.port 8502`.
 
-Upload individual PDFs/images, whole folders, or ZIP archives — ZIPs are unpacked
-for you and password-protected PDFs are matched against the built-in bank
-password table. The activity log streams per-page extractor progress, and the
+The page has two drop zones: the first takes individual PDFs/images/Word files and
+ZIP archives, the second takes **entire folders** — every supported file inside a
+folder, sub-folders included, is uploaded. Three ways to add more than one folder:
+
+- **Drag several folders onto the box together** — the only true one-shot route.
+- **Pick the parent folder** that holds them; sub-folders are walked recursively.
+- **Press Browse once per folder** — picks add up rather than replacing each other.
+
+The browser's own directory dialog is single-select (no web API offers a multi-folder
+picker), which is why the drag route exists. Both drop zones are processed together.
+ZIPs are unpacked for you and password-protected PDFs are matched against the built-in
+bank password table. Folder uploads need Streamlit 1.62 or newer. The activity log streams per-page extractor progress, and the
 finished workbook is offered as a download (written to a temp directory, never
 into the repo).
 
