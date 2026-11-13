@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import html
+import shutil
 import datetime
 import tempfile
 from pathlib import Path
@@ -599,6 +600,28 @@ def _normalize_uploaded_name(name: str) -> Path:
             continue
         parts.append(chunk)
     return Path(*parts) if parts else Path("upload.bin")
+
+
+# Uploads are staged and extracted this many at a time.  Small enough that one
+# batch's copies are negligible on a container's scratch disk, large enough that
+# the per-batch bookkeeping stays in the noise on a 700-file run.
+_UPLOAD_BATCH_SIZE = 25
+
+
+def _discard_temp_dirs(paths: Iterable[str]) -> None:
+    """Delete finished scratch directories.
+
+    Every run copies each upload to a fresh ``mkdtemp`` and writes the workbook
+    to a second one.  Nothing reclaimed them, so on a long-lived server (the
+    deployed app) a few folder-sized batches were enough to exhaust the disk and
+    take the container down.  Removal is best-effort: a directory that is already
+    gone, or still held open, must never break a run.
+    """
+    for raw in paths:
+        try:
+            shutil.rmtree(raw, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _stage_uploaded_files(uploaded_files, staging_dir: Path) -> list[Path]:
@@ -1310,31 +1333,18 @@ if process_clicked:
         st.session_state.get("uploaded_folders") or []
     )
 
-    input_paths: list[Path] = []
+    # The previous run's staging copies and its workbook are dead the moment a
+    # new run starts (the download button only ever serves the latest result),
+    # so reclaim them before this run adds more.
+    _discard_temp_dirs(st.session_state.get("temp_dirs") or [])
+    st.session_state.result_path = ""
+
     staged_root = Path(tempfile.mkdtemp(prefix="commission_streamlit_"))
+    st.session_state.temp_dirs = [str(staged_root)]
 
-    if uploaded_files:
-        staged_files = _stage_uploaded_files(uploaded_files, staged_root)
-        input_paths.extend(staged_files)
-        _append_log(
-            st.session_state.logs,
-            f"Staged {len(staged_files)} file(s) from {len(uploaded_files)} upload(s) "
-            "(folders walked, ZIPs unpacked).",
-            log_placeholder,
-        )
-
-    if not input_paths:
+    if not uploaded_files:
         st.warning("Upload at least one file or folder before processing.")
         st.stop()
-
-    unique_inputs: list[Path] = []
-    seen_inputs: set[str] = set()
-    for candidate in input_paths:
-        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
-        if key in seen_inputs:
-            continue
-        seen_inputs.add(key)
-        unique_inputs.append(candidate)
 
     extractor.load_agent_codes_from_xlsx()
     _append_log(st.session_state.logs, "Loaded agent codes.", log_placeholder)
@@ -1355,40 +1365,96 @@ if process_clicked:
 
     all_rows: list[extractor.ReceiptLineItem] = []
     progress = progress_placeholder.progress(0)
-    total = len(unique_inputs)
 
-    for index, file_path in enumerate(unique_inputs, start=1):
-        _append_log(st.session_state.logs, f"Processing {index}/{total}: {file_path}", log_placeholder)
-        file_pages = _count_pdf_pages(file_path)
-        file_rows = 0
-        file_status = ""
-        try:
-            password_override = _match_password(str(file_path), extractor.BANK_PASSWORDS)
-            rows = extractor.process_path(file_path, override_password=password_override or None)
-            if rows:
-                all_rows.extend(rows)
-                file_rows = len(rows)
-                file_status = "ok"
-                _append_log(st.session_state.logs, f"  → {len(rows)} row(s) extracted", log_placeholder)
-            else:
-                file_status = "no rows"
-                _append_log(st.session_state.logs, "  → no extractable receipt rows", log_placeholder)
-                # Hint the user when this looks like a scanned PDF and Vision is not configured.
-                if str(file_path).lower().endswith(".pdf") and not extractor._extractor.get_google_vision_api_key():
-                    _append_log(
-                        st.session_state.logs,
-                        "  ! This may be a scanned PDF.  GOOGLE_VISION_API_KEY is not set — "
-                        "add it to Streamlit secrets so cloud OCR is available.",
-                        log_placeholder,
-                    )
-        except Exception as exc:
-            file_status = f"failed: {exc}"
-            _append_log(st.session_state.logs, f"  → failed: {exc}", log_placeholder)
-            all_rows.append(extractor.build_placeholder_row(str(file_path), "", f"Extraction failed: {exc}"))
-        mis_file_details.append(
-            {"name": Path(file_path).name, "pages": file_pages, "rows": file_rows, "status": file_status}
+    # ── Batched staging and extraction ────────────────────────────────────
+    # Staging every upload before extracting any of them meant a 700-file run
+    # kept 700 copies on the scratch disk at once, which exhausted the deployed
+    # container.  Each batch is staged, extracted, and deleted before the next
+    # is written, so scratch usage stays flat however many files are queued.
+    # Rows accumulate in memory and never refer back to the files, so discarding
+    # a finished batch is safe.
+    batches = [
+        uploaded_files[start : start + _UPLOAD_BATCH_SIZE]
+        for start in range(0, len(uploaded_files), _UPLOAD_BATCH_SIZE)
+    ]
+    batch_count = len(batches)
+    _append_log(
+        st.session_state.logs,
+        f"{len(uploaded_files)} upload(s) queued in {batch_count} batch(es) of up to "
+        f"{_UPLOAD_BATCH_SIZE}.",
+        log_placeholder,
+    )
+
+    seen_inputs: set[str] = set()
+    processed = 0
+
+    for batch_no, batch in enumerate(batches, start=1):
+        batch_dir = staged_root / f"batch_{batch_no:04d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+
+        unique_inputs: list[Path] = []
+        for candidate in _stage_uploaded_files(batch, batch_dir):
+            key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+            if key in seen_inputs:
+                continue
+            seen_inputs.add(key)
+            unique_inputs.append(candidate)
+
+        _append_log(
+            st.session_state.logs,
+            f"Batch {batch_no}/{batch_count}: staged {len(unique_inputs)} file(s) from "
+            f"{len(batch)} upload(s) (folders walked, ZIPs unpacked).",
+            log_placeholder,
         )
-        progress.progress(index / total)
+
+        for position, file_path in enumerate(unique_inputs, start=1):
+            processed += 1
+            _append_log(
+                st.session_state.logs,
+                f"Processing {processed} (batch {batch_no}/{batch_count}): {file_path}",
+                log_placeholder,
+            )
+            file_pages = _count_pdf_pages(file_path)
+            file_rows = 0
+            file_status = ""
+            try:
+                password_override = _match_password(str(file_path), extractor.BANK_PASSWORDS)
+                rows = extractor.process_path(file_path, override_password=password_override or None)
+                if rows:
+                    all_rows.extend(rows)
+                    file_rows = len(rows)
+                    file_status = "ok"
+                    _append_log(st.session_state.logs, f"  → {len(rows)} row(s) extracted", log_placeholder)
+                else:
+                    file_status = "no rows"
+                    _append_log(st.session_state.logs, "  → no extractable receipt rows", log_placeholder)
+                    # Hint the user when this looks like a scanned PDF and Vision is not configured.
+                    if str(file_path).lower().endswith(".pdf") and not extractor._extractor.get_google_vision_api_key():
+                        _append_log(
+                            st.session_state.logs,
+                            "  ! This may be a scanned PDF.  GOOGLE_VISION_API_KEY is not set — "
+                            "add it to Streamlit secrets so cloud OCR is available.",
+                            log_placeholder,
+                        )
+            except Exception as exc:
+                file_status = f"failed: {exc}"
+                _append_log(st.session_state.logs, f"  → failed: {exc}", log_placeholder)
+                all_rows.append(extractor.build_placeholder_row(str(file_path), "", f"Extraction failed: {exc}"))
+            mis_file_details.append(
+                {"name": Path(file_path).name, "pages": file_pages, "rows": file_rows, "status": file_status}
+            )
+            progress.progress(
+                min(1.0, (batch_no - 1 + position / max(len(unique_inputs), 1)) / batch_count)
+            )
+
+        # Give the batch's scratch space back before the next one is written.
+        _discard_temp_dirs([str(batch_dir)])
+
+    progress.progress(1.0)
+
+    if processed == 0:
+        st.warning("No supported files were found in the upload.")
+        st.stop()
 
     # Post-extraction AI + arithmetic re-validation of the commission math so that
     # any row marked "Math Valid = YES" is genuinely valid (no false positives).
@@ -1405,6 +1471,7 @@ if process_clicked:
     output_dir  = Path(tempfile.mkdtemp(prefix="commission_streamlit_output_"))
     output_file = output_dir / "commission_results.xlsx"
     df.to_excel(output_file, index=False)
+    st.session_state.temp_dirs = [str(output_dir)]
 
     # Final safety net: re-validate the written workbook so no "Math Valid = YES"
     # row is a false positive (corrects the file in place if needed).
@@ -1425,6 +1492,11 @@ if process_clicked:
     _extractor_logger.removeHandler(_st_log_handler)
 
     st.session_state.result_path = str(output_file)
+
+    # The staged copies of the uploads have served their purpose — every row is
+    # already in the workbook — so give the disk back now rather than at the
+    # start of the next run, which may never come.
+    _discard_temp_dirs([str(staged_root)])
 
     _append_log(st.session_state.logs, f"Done. Wrote {len(df)} row(s) to {output_file}", log_placeholder)
     status_placeholder.success(f"Done — {len(df)} row(s) written successfully.")
